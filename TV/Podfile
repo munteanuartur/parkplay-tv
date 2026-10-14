@@ -1,0 +1,23 @@
+# ParkPlay TV — VLC pentru testul 4K (opțional). Autor: arturm
+#   cd TV && pod install   → apoi deschide ParkPlayTV.xcworkspace (nu .xcodeproj)
+platform :tvos, '17.0'
+
+target 'ParkPlayTV' do
+  use_frameworks!
+  pod 'TVVLCKit', '~> 3.6'
+end
+
+# Podspec-ul TVVLCKit cere tvOS 10.2, dar Xcode-ul nou acceptă doar 15.0+.
+# Punem toate pod-urile pe tvOS 17.0 (ca aplicația) și oprim sandbox-ul scripturilor.
+post_install do |installer|
+  installer.pods_project.targets.each do |t|
+    t.build_configurations.each do |c|
+      c.build_settings['TVOS_DEPLOYMENT_TARGET'] = '17.0'
+      c.build_settings['ENABLE_USER_SCRIPT_SANDBOXING'] = 'NO'
+      c.build_settings['ENABLE_MODULE_VERIFIER'] = 'NO'
+    end
+  end
+  installer.pods_project.build_configurations.each do |c|
+    c.build_settings['TVOS_DEPLOYMENT_TARGET'] = '17.0'
+  end
+end

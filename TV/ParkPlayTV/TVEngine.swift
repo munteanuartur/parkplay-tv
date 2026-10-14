@@ -1,0 +1,660 @@
+import SwiftUI
+import UIKit
+
+/// Poziția și durata (se schimbă des — separat, ca să nu redesenăm tot).
+@MainActor
+final class TVClock: ObservableObject {
+    @Published var position: Double = 0
+    @Published var duration: Double = 0
+}
+
+/// Ce aflăm despre WebKit-ul de pe Apple TV și despre redare (ecranul Diagnostic).
+@MainActor
+final class TVDiagnostics: ObservableObject {
+    @Published var webKit = PPWebView.availabilityInfo()
+    @Published var adRules = "—"
+    @Published var page: [String: String] = [:]
+    @Published var fps: Double = 0
+    @Published var kbps: Double = 0
+    @Published var dropped = 0
+    @Published var frames = 0
+    @Published var buffer: Double = 0
+    @Published var videoSize = "—"
+    @Published var codecs = ""
+    @Published var connection = ""
+    @Published var adsSkipped = 0
+    @Published var lastEvent = ""
+}
+
+/// Motorul de redare pentru Apple TV: lista, WKWebView-ul cu pagina YouTube și scripturile
+/// comune cu versiunea de Mac (PageScripts), calitatea, viteza, SponsorBlock, Autoplay.
+/// Autor: arturm
+@MainActor
+final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
+
+    static let shared = TVEngine()
+
+    enum SiteMode: String, CaseIterable, Identifiable {
+        case desktop, mobile
+        var id: String { rawValue }
+        var title: String { self == .desktop ? "Desktop (www, până la 4K)" : "Mobil (m.youtube, HLS)" }
+        var userAgent: String {
+            switch self {
+            case .desktop:
+                return "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
+            case .mobile:
+                return "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
+            }
+        }
+        func url(_ id: String, start: Int) -> String {
+            let host = self == .desktop ? "https://www.youtube.com" : "https://m.youtube.com"
+            return "\(host)/watch?v=\(id)" + (start > 5 ? "&t=\(start)s" : "")
+        }
+    }
+
+    static let levels: [(String, String)] = [
+        ("hd2160", "2160p (4K)"), ("hd1440", "1440p"), ("hd1080", "1080p"), ("hd720", "720p"),
+        ("large", "480p"), ("medium", "360p"), ("small", "240p"), ("tiny", "144p"),
+    ]
+    static func label(_ q: String) -> String { levels.first { $0.0 == q }?.1 ?? (q == "auto" ? "Auto" : q) }
+
+    let clock = TVClock()
+    let diag = TVDiagnostics()
+    private(set) var web: PPWebView?
+
+    @Published private(set) var queue: [Track] = []
+    @Published private(set) var index = -1
+    @Published private(set) var playing = false
+    @Published private(set) var wantPlay = false
+    @Published private(set) var buffering = false
+    @Published private(set) var inAd = false
+    @Published private(set) var qualities: [String] = []
+    @Published private(set) var currentQuality = ""
+    @Published private(set) var extending = false
+    @Published var quality: String { didSet { UserDefaults.standard.set(quality, forKey: "quality"); applyState() } }
+    @Published var rate: Double { didSet { UserDefaults.standard.set(rate, forKey: "rate"); applyState() } }
+    @Published var siteMode: SiteMode {
+        didSet {
+            UserDefaults.standard.set(siteMode.rawValue, forKey: "site")
+            web?.setUserAgent(siteMode.userAgent)
+            if index >= 0 { playIndex(index, start: clock.position) }
+        }
+    }
+    @Published var sponsorBlock: Bool { didSet { UserDefaults.standard.set(sponsorBlock, forKey: "sponsorblock") } }
+    @Published var autoplay: Bool { didSet { UserDefaults.standard.set(autoplay, forKey: "autoplay") } }
+
+    /// Video-ul curent e încărcat în pagină (după repornirea aplicației, încă nu).
+    @Published private(set) var loaded = false
+    /// Miniaturile pentru bara de derulare (din răspunsul playerului YouTube).
+    @Published private(set) var storyboard: Storyboard?
+
+    // ---- Subtitrări ----
+    struct CaptionTrack: Identifiable, Hashable {
+        let code: String
+        let name: String
+        let auto: Bool
+        var id: String { code + (auto ? "#auto" : "") }
+    }
+    @Published private(set) var captionTracks: [CaptionTrack] = []
+    /// "off", un cod de limbă („ro”, „en”…) sau "tr:ro" (traducere automată în limba dată).
+    @Published var captionChoice: String { didSet { UserDefaults.standard.set(captionChoice, forKey: "captions"); applyCaptions() } }
+    @Published var captionSize: Double { didSet { UserDefaults.standard.set(captionSize, forKey: "cc_size"); applyCaptions() } }
+
+    var current: Track? { queue.indices.contains(index) ? queue[index] : nil }
+
+    private var ready = false
+    private var pendingURL: URL?
+    private var loadedAt: TimeInterval = 0
+    private var segments: [SponsorBlock.Segment] = []
+    private var lastAdState = false
+    private var lastStatTick: TimeInterval = 0
+    private var lastFlush: TimeInterval = 0
+    private var lastPositionSave: TimeInterval = 0
+
+    /// Calitățile pe care le oferă YouTube pentru video-ul curent (de la cea mai bună).
+    var availableLevels: [(String, String)] {
+        qualities.isEmpty ? [] : Self.levels.filter { qualities.contains($0.0) }
+    }
+
+    private override init() {
+        let d = UserDefaults.standard
+        quality = d.string(forKey: "quality") ?? "hd1080"
+        rate = d.object(forKey: "rate") as? Double ?? 1.0
+        siteMode = SiteMode(rawValue: d.string(forKey: "site") ?? "") ?? .mobile // pe Apple TV doar mobilul merge (fără MSE)
+        sponsorBlock = d.object(forKey: "sponsorblock") as? Bool ?? true
+        autoplay = d.object(forKey: "autoplay") as? Bool ?? true
+        captionChoice = d.string(forKey: "captions") ?? "off"
+        captionSize = d.object(forKey: "cc_size") as? Double ?? 1.0
+        super.init()
+        restoreSession()
+        setupWebView()
+    }
+
+    private func now() -> TimeInterval { ProcessInfo.processInfo.systemUptime }
+
+    // MARK: - WebView
+
+    private func setupWebView() {
+        guard let w = PPWebView(frame: CGRect(x: 0, y: 0, width: 1920, height: 1080),
+                                userAgent: siteMode.userAgent, delegate: self) else {
+            diag.webKit = PPWebView.availabilityInfo() + " — WKWebView nu a putut fi creat"
+            return
+        }
+        web = w
+        w.addDocumentStartScript(PageScripts.adBlock, mainFrameOnly: false)
+        w.addDocumentStartScript(PageScripts.bridge, mainFrameOnly: true)
+        let year = Date().addingTimeInterval(3600 * 24 * 365)
+        let cookies = [
+            HTTPCookie(properties: [.name: "SOCS", .value: "CAI", .domain: ".youtube.com", .path: "/", .secure: "TRUE", .expires: year]),
+            HTTPCookie(properties: [.name: "CONSENT", .value: "YES+1", .domain: ".youtube.com", .path: "/", .expires: year]),
+        ].compactMap { $0 }
+        w.addContentRules(PageScripts.adBlockRules, identifier: "ParkPlayAdBlock-1") { [weak self] ok, err in
+            Task { @MainActor in
+                guard let self else { return }
+                self.diag.adRules = ok ? "active (filtru de rețea)" : "indisponibile: \(err ?? "?") — rămâne json-prune"
+                self.rulesDone = true
+                self.maybeReady()
+            }
+        }
+        w.setCookies(cookies) { [weak self] in
+            Task { @MainActor in
+                self?.cookiesDone = true
+                self?.maybeReady()
+            }
+        }
+    }
+
+    private var rulesDone = false
+    private var cookiesDone = false
+
+    /// Aplicația e în fundal: nimic nu are voie să se încarce sau să cânte.
+    private(set) var suspended = false
+    @Published private(set) var radioLoading = false
+
+    private func maybeReady() {
+        guard rulesDone && cookiesDone, !ready, let w = web else { return }
+        ready = true
+        if let u = pendingURL { pendingURL = nil; w.load(u) }
+    }
+
+    private func js(_ code: String) { web?.evaluate(code, completion: nil) }
+
+    private func stateJs() -> String {
+        "window.__ppRate=\(rate);window.__ppQ='\(quality)';window.__ppWant=\(wantPlay);window.__ppStats=true;"
+    }
+
+    private func applyState() { js(stateJs()) }
+
+    // MARK: - Comenzi
+
+    func playList(_ list: [Track], start: Int) {
+        guard !list.isEmpty else { return }
+        queue = list
+        playIndex(min(max(start, 0), list.count - 1))
+    }
+
+    /// `start` nil = de unde ai rămas data trecută (ca pe YouTube) sau de la început.
+    func playIndex(_ i: Int, start requested: Double? = nil) {
+        guard queue.indices.contains(i) else { return }
+        savePosition()
+        let t = queue[i]
+        let start = requested ?? WatchPositions.resumePoint(t.id) ?? 0
+        if requested == nil && start > 0 { TVAppState.shared.toast("Continui de la \(TVTime.fmt(start))") }
+        index = i
+        loaded = true
+        storyboard = nil
+        captionTracks = []
+        wantPlay = true
+        playing = false
+        buffering = true
+        inAd = false
+        qualities = []
+        currentQuality = ""
+        segments = []
+        clock.position = start
+        clock.duration = t.expectedDuration
+        loadedAt = now()
+        diag.lastEvent = "încarc \(t.id) (\(siteMode == .desktop ? "desktop" : "mobil"))"
+        Library.addHistory(t)
+        StatsStore.countPlay(t)
+        lastStatTick = 0
+        guard let u = URL(string: siteMode.url(t.id, start: Int(start))) else { return }
+        if ready { web?.load(u) } else { pendingURL = u }
+        saveSession()
+        if sponsorBlock {
+            Task { @MainActor in
+                let s = await SponsorBlock.segments(t.id)
+                if current?.id == t.id { segments = s }
+            }
+        }
+    }
+
+    func play() {
+        guard index >= 0 else { return }
+        if !loaded { playIndex(index); return }
+        wantPlay = true
+        js("window.__ppWant=true;(function(){var v=document.querySelector('video.html5-main-video')||document.querySelector('video');if(v){v.muted=false;var p=v.play();if(p&&p.catch)p.catch(function(){});}})();")
+    }
+
+    func pause() {
+        savePosition()
+        wantPlay = false
+        playing = false
+        lastStatTick = 0
+        StatsStore.flush()
+        js("window.__ppWant=false;document.querySelectorAll('video').forEach(function(v){v.pause();});")
+    }
+
+    func toggle() { wantPlay ? pause() : play() }
+
+    /// Pune un video imediat după cel curent (sau îl pornește dacă nu cântă nimic).
+    func playNext(_ t: Track) {
+        guard let cur = current else { playList([t], start: 0); return }
+        var q = queue
+        q.removeAll { $0.id == t.id && $0.id != cur.id }
+        let at = min((q.firstIndex { $0.id == cur.id } ?? 0) + 1, q.count)
+        q.insert(t, at: at)
+        queue = q
+        index = queue.firstIndex { $0.id == cur.id } ?? 0
+    }
+
+    /// Adaugă la finalul listei.
+    func enqueue(_ t: Track) {
+        guard current != nil else { playList([t], start: 0); return }
+        if !queue.contains(where: { $0.id == t.id }) { queue.append(t) }
+    }
+
+    func next() {
+        if index + 1 < queue.count { playIndex(index + 1) } else { extend() }
+    }
+
+    func previous() {
+        if clock.position > 5 || index <= 0 { seek(to: 0) } else { playIndex(index - 1) }
+    }
+
+    func seek(to s: Double) {
+        let v = max(0, s)
+        clock.position = v
+        js("(function(){var v=document.querySelector('video.html5-main-video')||document.querySelector('video');if(v)v.currentTime=\(v);})();")
+    }
+
+    func seek(by d: Double) {
+        let dur = clock.duration > 0 ? clock.duration : .greatestFiniteMagnitude
+        seek(to: min(max(clock.position + d, 0), max(dur - 1, 0)))
+    }
+
+    func stop() {
+        pause()
+        web?.load(URL(string: "about:blank")!)
+        index = -1
+    }
+
+    // MARK: - Diagnostic
+
+    /// Ce suportă WebKit-ul de pe Apple TV (MSE, codecuri) și ce e în pagină.
+    func runDiagnostics() {
+        let code = """
+        (function(){
+          var v = document.createElement('video');
+          function c(t){ try { return v.canPlayType(t) || 'nu'; } catch (e) { return 'eroare'; } }
+          function m(t){ try { var M = window.MediaSource || window.ManagedMediaSource; return M && M.isTypeSupported(t) ? 'da' : 'nu'; } catch (e) { return 'eroare'; } }
+          var mp = document.getElementById('movie_player');
+          var lv = '';
+          try { lv = (mp && mp.getAvailableQualityLevels) ? mp.getAvailableQualityLevels().join(', ') : ''; } catch (e) {}
+          return JSON.stringify({
+            'User agent': navigator.userAgent,
+            'Pagina': location.href,
+            'MediaSource (MSE)': window.MediaSource ? 'da' : 'nu',
+            'ManagedMediaSource': window.ManagedMediaSource ? 'da' : 'nu',
+            'MSE H.264': m('video/mp4; codecs="avc1.4d401f"'),
+            'MSE VP9': m('video/webm; codecs="vp09.00.10.08"'),
+            'MSE AV1': m('video/mp4; codecs="av01.0.05M.08"'),
+            'HLS': c('application/vnd.apple.mpegurl'),
+            'Player YouTube': mp ? 'da' : 'nu',
+            'Calități oferite': lv || '—',
+            'Video în pagină': document.querySelectorAll('video').length + ''
+          });
+        })()
+        """
+        web?.evaluate(code) { [weak self] r, err in
+            Task { @MainActor in
+                guard let self else { return }
+                if let s = r as? String, let d = s.data(using: .utf8),
+                   let o = try? JSONSerialization.jsonObject(with: d) as? [String: String] {
+                    self.diag.page = o
+                } else {
+                    self.diag.page = ["Eroare": err?.localizedDescription ?? "pagina nu răspunde"]
+                }
+            }
+        }
+    }
+
+    // MARK: - „Browserul tău nu poate reda videoclipul”
+
+    /// Pagina desktop cere Media Source Extensions, pe care WebKit-ul de pe Apple TV poate să nu le aibă.
+    /// Dacă YouTube afișează o eroare de redare, trecem singuri pe site-ul mobil (HLS, fără MSE).
+    private var checkTask: Task<Void, Never>?
+
+    func checkPlayable(after seconds: Double) {
+        checkTask?.cancel()
+        let id = current?.id
+        checkTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            guard !Task.isCancelled, current?.id == id else { return }
+            let code = """
+            (function(){
+              var sel = '.ytp-error-content-wrap-reason, .ytp-error, .player-error, ytm-player-error-message-renderer, .ytm-player-error-message-renderer';
+              var e = document.querySelector(sel);
+              var t = e ? (e.innerText || e.textContent || '').trim() : '';
+              return JSON.stringify({err: t, mse: !!(window.MediaSource || window.ManagedMediaSource)});
+            })()
+            """
+            self.web?.evaluate(code) { r, _ in
+                Task { @MainActor in
+                    guard let s = r as? String, let d = s.data(using: .utf8),
+                          let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { return }
+                    let err = o["err"] as? String ?? ""
+                    let mse = o["mse"] as? Bool ?? false
+                    if !err.isEmpty || (!mse && self.siteMode == .desktop && !self.playing) {
+                        if self.siteMode == .desktop {
+                            self.diag.lastEvent = "desktop nu merge (" + (err.isEmpty ? "fără MSE" : err) + ") → trec pe mobil"
+                            self.siteMode = .mobile   // reîncarcă video-ul curent pe m.youtube
+                        } else {
+                            self.diag.lastEvent = "YouTube (mobil): " + (err.isEmpty ? "video-ul nu pornește" : err)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: - Autoplay
+
+    private func extend() {
+        guard let last = current, autoplay, !extending else { return }
+        extending = true
+        Task { @MainActor in
+            let mix = await YouTubeSearch.mix(last.id)
+            extending = false
+            let known = Set(queue.map(\.id))
+            let fresh = Array(mix.filter { !known.contains($0.id) }.prefix(25))
+            guard !fresh.isEmpty, current?.id == last.id else { return }
+            queue += fresh
+            playIndex(index + 1)
+        }
+    }
+
+    // MARK: - PPWebViewDelegate
+
+    nonisolated func ppWebViewDidFinish() {
+        Task { @MainActor in
+            guard !self.suspended else { return }
+            self.web?.evaluate(PageScripts.bridge, completion: nil)
+            self.applyState()
+            self.diag.lastEvent = "pagina s-a încărcat"
+            self.runDiagnostics()
+            self.checkPlayable(after: 4)
+            self.loadPageInfo(attempt: 0)
+        }
+    }
+
+    nonisolated func ppWebViewProcessTerminated() {
+        Task { @MainActor in
+            // În fundal tvOS oprește singur procesul paginii: NU îl repornim (ar porni video-ul
+            // fără ecran și ar ține / trezi Apple TV-ul). Îl reîncărcăm doar dacă ne uităm.
+            guard !self.suspended, self.loaded else { self.loaded = false; return }
+            self.diag.lastEvent = "procesul paginii a căzut — reîncarc"
+            self.web?.reload()
+        }
+    }
+
+    // MARK: - Fundal: aplicația ieșită de pe ecran se oprește de tot
+
+    /// Apăsat Home / TV-ul adoarme: salvăm unde ai rămas, oprim video-ul și golim pagina
+    /// (altfel WebKit continuă să cânte în procesul lui și Apple TV-ul nu mai doarme).
+    func suspend() {
+        guard !suspended else { return }
+        savePosition()
+        saveSession()
+        suspended = true
+        checkTask?.cancel()
+        wantPlay = false
+        playing = false
+        buffering = false
+        lastStatTick = 0
+        js("window.__ppWant=false;document.querySelectorAll('video').forEach(function(v){try{v.pause();v.removeAttribute('src');v.load();}catch(e){}});")
+        pendingURL = nil
+        if ready { web?.load(URL(string: "about:blank")!) }
+        loaded = false
+        if queue.indices.contains(index) { clock.position = WatchPositions.resumePoint(queue[index].id) ?? clock.position }
+        StatsStore.flush()
+        Prefs.shared.writeNow()
+    }
+
+    /// Înapoi pe ecran: video-ul rămâne oprit; „Continuă” / ▶ îl pornește de unde ai rămas.
+    func wake() {
+        suspended = false
+    }
+
+    // MARK: - Radio: o listă nesfârșită de video-uri asemănătoare cu cel curent
+
+    func startRadio() {
+        guard let cur = current, !radioLoading else { return }
+        radioLoading = true
+        TVAppState.shared.toast("📻 Pornesc radioul…")
+        Task { @MainActor in
+            let mix = await YouTubeSearch.mix(cur.id, limit: 50)
+            radioLoading = false
+            guard current?.id == cur.id else { return }
+            let fresh = mix.filter { $0.id != cur.id }
+            guard !fresh.isEmpty else { TVAppState.shared.toast("Nu am găsit video-uri asemănătoare"); return }
+            queue = [cur] + fresh
+            index = 0
+            if !autoplay { autoplay = true }
+            saveSession()
+            TVAppState.shared.toast("📻 Radio: \(fresh.count) video-uri ca „\(cur.title)”")
+        }
+    }
+
+    nonisolated func ppWebViewMessage(_ body: Any) {
+        let dict = body as? [String: Any]
+        Task { @MainActor in if let dict { self.receive(dict) } }
+    }
+
+    private func receive(_ m: [String: Any]) {
+        func d(_ k: String) -> Double { (m[k] as? NSNumber)?.doubleValue ?? 0 }
+        func b(_ k: String) -> Bool { (m[k] as? NSNumber)?.boolValue ?? false }
+        switch m["t"] as? String {
+        case "state":
+            onState(playing: b("p"), pos: d("pos"), dur: d("d"), ad: b("ad"), buf: b("buf"))
+        case "ended":
+            onEnded()
+        case "q":
+            qualities = (m["l"] as? [Any])?.compactMap { $0 as? String } ?? []
+            currentQuality = m["c"] as? String ?? ""
+        case "stats":
+            diag.fps = max(0, d("fps"))
+            diag.kbps = max(0, d("kbps"))
+            diag.dropped = Int(d("dropped"))
+            diag.frames = Int(d("frames"))
+            diag.buffer = d("buf")
+            let w = Int(d("vw")), h = Int(d("vh"))
+            diag.videoSize = w > 0 ? "\(w)×\(h)" : "—"
+            diag.codecs = m["codecs"] as? String ?? ""
+            diag.connection = m["conn"] as? String ?? ""
+        default:
+            break
+        }
+    }
+
+    private func onState(playing p: Bool, pos: Double, dur: Double, ad: Bool, buf: Bool) {
+        guard let t = current else { return }
+        let expected = t.expectedDuration
+        let looksAd = ad || (expected > 0 && dur > 0 && abs(dur - expected) > 5)
+        if looksAd && !lastAdState { diag.adsSkipped += 1 }
+        lastAdState = looksAd
+        if inAd != looksAd { inAd = looksAd }
+        if playing != p { playing = p }
+        let b = p ? buf : (buf || (wantPlay && now() - loadedAt < 30 && pos < 1))
+        if buffering != b { buffering = b }
+        let n = now()
+        if p && !looksAd && lastStatTick > 0 { StatsStore.addListening(t, seconds: min(n - lastStatTick, 5)) }
+        lastStatTick = (p && !looksAd) ? n : 0
+        if n - lastFlush > 30 { lastFlush = n; StatsStore.flush() }
+        guard !looksAd else { return }
+        clock.position = pos
+        if dur > 0 { clock.duration = dur }
+        if p && n - lastPositionSave > 10 { savePosition() }
+        if p, let seg = segments.first(where: { pos >= $0.start - 0.3 && pos < $0.end - 0.7 }) {
+            seek(to: seg.end)
+        }
+    }
+
+    private func onEnded() {
+        if inAd || now() - loadedAt < 4 { return }
+        let ref = clock.duration > 0 ? clock.duration : (current?.expectedDuration ?? 0)
+        if ref > 0 && clock.position < ref - 10 { return }
+        if let t = current { WatchPositions.set(t.id, position: ref, duration: ref) } // văzut până la capăt
+        next()
+    }
+
+    // MARK: - Unde ai rămas + sesiunea (lista) la repornire
+
+    /// Salvează poziția video-ului curent (pentru „continuă de unde ai rămas”).
+    func savePosition() {
+        lastPositionSave = now()
+        guard loaded, let t = current, clock.position > 0 else { return }
+        WatchPositions.set(t.id, position: clock.position, duration: clock.duration)
+    }
+
+    private struct Session: Codable {
+        let queue: [Track]
+        let index: Int
+    }
+
+    private func saveSession() {
+        let s = Session(queue: Array(queue.prefix(200)), index: min(index, 199))
+        if let d = try? JSONEncoder().encode(s) { UserDefaults.standard.set(d, forKey: "tv_session") }
+    }
+
+    private func restoreSession() {
+        guard let d = UserDefaults.standard.data(forKey: "tv_session"),
+              let s = try? JSONDecoder().decode(Session.self, from: d), s.queue.indices.contains(s.index) else { return }
+        queue = s.queue
+        index = s.index
+        loaded = false
+        clock.position = WatchPositions.resumePoint(s.queue[s.index].id) ?? 0
+        clock.duration = s.queue[s.index].expectedDuration
+    }
+
+    /// Butonul „Continuă” de pe Acasă: pornește video-ul de unde ai rămas.
+    func resume() {
+        if !loaded && index >= 0 { playIndex(index) } else if !wantPlay { play() }
+    }
+
+    /// Aplicația iese de pe ecran: ține minte tot.
+    func saveAll() {
+        savePosition()
+        saveSession()
+        StatsStore.flush()
+        Prefs.shared.writeNow()
+    }
+
+    // MARK: - Subtitrări și storyboard (din răspunsul playerului)
+
+    /// Citește din pagină lista de subtitrări și storyboard-ul (reîncearcă până e gata playerul).
+    private func loadPageInfo(attempt: Int) {
+        let id = current?.id
+        let code = """
+        (function(){
+          try {
+            var mp = document.getElementById('movie_player');
+            var r = null;
+            try { r = mp && mp.getPlayerResponse ? mp.getPlayerResponse() : null; } catch (e) {}
+            if (!r || !r.videoDetails) r = window.ytInitialPlayerResponse || r;
+            if (!r) return '';
+            var out = {vid: (r.videoDetails && r.videoDetails.videoId) || '', tracks: [], sb: ''};
+            var c = r.captions && r.captions.playerCaptionsTracklistRenderer;
+            if (c && c.captionTracks) c.captionTracks.forEach(function(t){
+              var n = t.name ? (t.name.simpleText || (t.name.runs || []).map(function(x){ return x.text; }).join('')) : t.languageCode;
+              out.tracks.push({code: t.languageCode, name: n || t.languageCode, auto: t.kind === 'asr'});
+            });
+            var s = r.storyboards && (r.storyboards.playerStoryboardSpecRenderer || r.storyboards.playerLiveStoryboardSpecRenderer);
+            if (s && s.spec) out.sb = s.spec;
+            return JSON.stringify(out);
+          } catch (e) { return ''; }
+        })()
+        """
+        web?.evaluate(code) { r, _ in
+            Task { @MainActor in
+                guard self.current?.id == id else { return }
+                guard let str = r as? String, let d = str.data(using: .utf8),
+                      let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+                      (o["vid"] as? String ?? "") == (id ?? "") else {
+                    if attempt < 6 {
+                        Task { @MainActor in
+                            try? await Task.sleep(nanoseconds: 1_500_000_000)
+                            self.loadPageInfo(attempt: attempt + 1)
+                        }
+                    }
+                    return
+                }
+                let tracks = (o["tracks"] as? [[String: Any]] ?? []).compactMap { t -> CaptionTrack? in
+                    guard let c = t["code"] as? String else { return nil }
+                    return CaptionTrack(code: c, name: t["name"] as? String ?? c, auto: (t["auto"] as? Bool) ?? false)
+                }
+                self.captionTracks = tracks
+                self.storyboard = (o["sb"] as? String).flatMap { Storyboard(spec: $0) }
+                self.applyCaptions()
+            }
+        }
+    }
+
+    /// Pornește / oprește subtitrările în playerul YouTube (le desenează chiar YouTube).
+    func applyCaptions() {
+        var code = ""
+        var translate = ""
+        if captionChoice != "off" && !captionTracks.isEmpty {
+            let manual = captionTracks.first { !$0.auto } ?? captionTracks[0]
+            if captionChoice.hasPrefix("tr:") {
+                let lang = String(captionChoice.dropFirst(3))
+                if let own = captionTracks.first(where: { $0.code == lang && !$0.auto }) ?? captionTracks.first(where: { $0.code == lang }) {
+                    code = own.code
+                } else {
+                    code = manual.code
+                    translate = lang
+                }
+            } else if let t = captionTracks.first(where: { $0.code == captionChoice && !$0.auto })
+                        ?? captionTracks.first(where: { $0.code == captionChoice }) {
+                code = t.code
+            } else {
+                // Video-ul n-are limba aleasă: traducere automată din prima pistă.
+                code = manual.code
+                translate = captionChoice
+            }
+        }
+        let opts: [String: Any] = ["code": code, "tl": translate, "size": captionSize]
+        guard let d = try? JSONSerialization.data(withJSONObject: opts) else { return }
+        let o = String(decoding: d, as: UTF8.self)
+        js("""
+        (function(o){
+          var mp = document.getElementById('movie_player');
+          var root = document.documentElement;
+          root.style.setProperty('--pp-cc-size', String(o.size));
+          if (!mp || !mp.setOption) return;
+          if (!o.code) {
+            root.classList.remove('pp-cc');
+            try { mp.setOption('captions', 'track', {}); } catch (e) {}
+            try { mp.unloadModule('captions'); } catch (e) {}
+            return;
+          }
+          root.classList.add('pp-cc');
+          try { mp.loadModule('captions'); } catch (e) {}
+          var t = {languageCode: o.code};
+          if (o.tl) t.translationLanguage = {languageCode: o.tl};
+          var set = function(){ try { mp.setOption('captions', 'track', t); } catch (e) {} };
+          set(); setTimeout(set, 800); setTimeout(set, 2500);
+        })(\(o));
+        """)
+    }
+}

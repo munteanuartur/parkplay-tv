@@ -1,0 +1,10 @@
+# Xcode
+build/
+DerivedData/
+xcuserdata/
+*.xcuserstate
+.DS_Store
+# CocoaPods (run `pod install` in TV/)
+TV/Pods/
+# Your personal signing settings
+TV/tools/local.conf
