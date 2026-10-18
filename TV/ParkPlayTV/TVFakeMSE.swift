@@ -172,6 +172,35 @@ enum FakeMSE {
       MS.prototype.endOfStream = function(){ this.readyState = 'ended'; };
       MS.prototype.setLiveSeekableRange = function(){};
       MS.prototype.clearLiveSeekableRange = function(){};
+      // 1080p: player-ul YouTube alege calitatea și după ce crede că poate decoda / afișa dispozitivul.
+      // Îi spunem ce poate de fapt Apple TV: ecran 1920×1080, decodare H.264 fluidă.
+      S.screenBefore = (window.screen ? screen.width + '×' + screen.height : '?') + ' @' + (window.devicePixelRatio || 1) + 'x, fereastră ' + innerWidth + '×' + innerHeight;
+      try {
+        if (window.screen && screen.width < 1920) {
+          Object.defineProperty(screen, 'width', {get: function(){ return 1920; }});
+          Object.defineProperty(screen, 'height', {get: function(){ return 1080; }});
+          Object.defineProperty(screen, 'availWidth', {get: function(){ return 1920; }});
+          Object.defineProperty(screen, 'availHeight', {get: function(){ return 1080; }});
+        }
+      } catch (e) { S.errors.push('ecran: ' + e); }
+      try {
+        var mc = navigator.mediaCapabilities;
+        if (mc && mc.decodingInfo) {
+          var origDI = mc.decodingInfo.bind(mc);
+          mc.decodingInfo = function(cfg){
+            var ct = (cfg && cfg.video && cfg.video.contentType) || (cfg && cfg.audio && cfg.audio.contentType) || '';
+            S.di = (S.di || 0) + 1;
+            if (okType(ct)) return Promise.resolve({supported: true, smooth: true, powerEfficient: true});
+            if (cfg && cfg.type === 'media-source') return Promise.resolve({supported: false, smooth: false, powerEfficient: false});
+            return origDI(cfg);
+          };
+        }
+      } catch (e) { S.errors.push('mediaCapabilities: ' + e); }
+      // Calitatea preferată salvată de site (ca atunci când alegi 1080p în meniul YouTube).
+      try {
+        var now = Date.now();
+        localStorage.setItem('yt-player-quality', JSON.stringify({data: JSON.stringify({quality: 1080, previousQuality: 720}), expiration: now + 31536e6, creation: now}));
+      } catch (e) {}
       try {
         window.MediaSource = MS; window.ManagedMediaSource = MS; window.WebKitMediaSource = MS; window.SourceBuffer = SB;
       } catch (e) { S.errors.push('instalare: ' + e); }
@@ -425,6 +454,9 @@ enum FakeMSE {
       var fv = document.querySelector('video');
       o['MSE fals: video simulat'] = fv && fv.__ppS ? ('timp ' + fv.__ppS.t.toFixed(1) + ' s, ' + (fv.__ppS.paused ? 'pauză' : (fv.__ppS.playing ? 'rulează' : 'așteaptă')) + ', pregătire ' + fv.__ppS.rs + ', ' + fv.videoWidth + '×' + fv.videoHeight) : '—';
       o['MSE fals: depanare'] = JSON.stringify(S.dbg);
+      var q = '';
+      try { q = mp && mp.getPlaybackQuality ? mp.getPlaybackQuality() : ''; } catch (e) {}
+      o['MSE fals: ecran / calitate'] = (S.screenBefore || '?') + ' · cereri decodingInfo: ' + (S.di || 0) + ' · calitate curentă: ' + (q || '—') + ' · cerută: ' + (window.__ppQ || '—');
       o['MSE fals: total primit'] = S.appends + ' bucăți, ' + Math.round(S.bytes / 1024) + ' KB';
       o['MSE fals: cereri video'] = S.net.n + ' (ok ' + S.net.ok + ', eșuate ' + S.net.bad + ', coduri ' + JSON.stringify(S.net.codes) + ', SABR ' + S.net.sabr + ', pot ' + S.net.pot + ')';
       o['MSE fals: răspunsuri video'] = S.net.resp.join('\n') || '—';
