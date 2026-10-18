@@ -295,7 +295,17 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
     private func js(_ code: String) { web?.evaluate(code, completion: nil) }
 
     private func stateJs() -> String {
-        "window.__ppRate=\(rate);window.__ppQ='\(quality)';window.__ppWant=\(wantPlay);window.__ppStats=true;"
+        "window.__ppRate=\(rate);window.__ppQ='\(webQualityOverride ?? quality)';window.__ppWant=\(wantPlay);window.__ppStats=true;"
+    }
+
+    /// Calitatea aleasă din player pentru video-ul curent (pe pagina YouTube); următorul pornește după setare.
+    @Published private(set) var webQualityOverride: String?
+
+    func selectWebQuality(_ q: String) {
+        webQualityOverride = q
+        // __ppQSet gol = scriptul paginii aplică imediat noua calitate.
+        js("window.__ppQ='\(q)';window.__ppQSet='';")
+        diag.lastEvent = "calitate aleasă: " + Self.label(q)
     }
 
     private func applyState() { js(stateJs()) }
@@ -336,6 +346,7 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
         guard let u = URL(string: siteMode.url(t.id, start: Int(start))) else { return }
         loadToken += 1
         let token = loadToken
+        webQualityOverride = nil
         mseFallback = false
         mseStatAt = 0
         if playerMode == .native {

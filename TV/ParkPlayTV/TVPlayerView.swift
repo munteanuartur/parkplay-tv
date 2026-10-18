@@ -257,16 +257,33 @@ struct TVPlayerView: View {
                 }
                 // Calitatea pentru video-ul curent (H.264 cu AVPlayer; peste 1080p VP9 cu VLC).
                 Menu {
-                    if engine.choices.isEmpty {
-                        Text(engine.nativeActive ? "Se încarcă…" : "Pe pagina YouTube calitatea o alege YouTube")
-                    }
-                    ForEach(engine.choices) { c in
-                        Button { engine.selectChoice(c.id) } label: {
-                            CheckLabel(title: c.label, on: engine.currentChoice == c.id)
+                    if engine.nativeActive {
+                        if engine.choices.isEmpty { Text("Se încarcă…") }
+                        ForEach(engine.choices) { c in
+                            Button { engine.selectChoice(c.id) } label: {
+                                CheckLabel(title: c.label, on: engine.currentChoice == c.id)
+                            }
+                        }
+                    } else {
+                        // Pe pagina YouTube: nivelurile oferite de player-ul YouTube pentru video-ul curent.
+                        if engine.availableLevels.isEmpty { Text("Se încarcă…") }
+                        ForEach(engine.availableLevels, id: \.0) { l in
+                            Button { engine.selectWebQuality(l.0) } label: {
+                                CheckLabel(title: l.1, on: engine.currentQuality == l.0)
+                            }
+                        }
+                        if !engine.availableLevels.isEmpty {
+                            Button { engine.selectWebQuality("auto") } label: {
+                                CheckLabel(title: "Auto (după viteza rețelei)", on: engine.webQualityOverride == "auto")
+                            }
                         }
                     }
                 } label: {
-                    Text(engine.choices.first { $0.id == engine.currentChoice }.map { "\($0.height)p" + ($0.vlc ? " VLC" : "") } ?? "Calitate")
+                    if engine.nativeActive {
+                        Text(engine.choices.first { $0.id == engine.currentChoice }.map { "\($0.height)p" + ($0.vlc ? " VLC" : "") } ?? "Calitate")
+                    } else {
+                        Text(engine.currentQuality.isEmpty ? "Calitate" : TVEngine.label(engine.currentQuality))
+                    }
                 }
                 // Radio: după video-ul curent urmează la nesfârșit video-uri asemănătoare.
                 Button { engine.startRadio(); scheduleHide() } label: {
