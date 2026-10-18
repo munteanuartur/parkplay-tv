@@ -206,6 +206,15 @@ enum FakeMSE {
         var now = Date.now();
         localStorage.setItem('yt-player-quality', JSON.stringify({data: JSON.stringify({quality: 1080, previousQuality: 720}), expiration: now + 31536e6, creation: now}));
       } catch (e) {}
+      // Pe Apple TV-ul real YouTube preferă HLS dacă WebKit spune că îl poate reda — dar în WebView-ul
+      // de pe tvOS HLS dă doar sunet (imaginea nu se desenează). Ascundem HLS, ca să folosească MediaSource.
+      try {
+        var origCPT = HTMLMediaElement.prototype.canPlayType;
+        HTMLMediaElement.prototype.canPlayType = function(t){
+          if (/mpegurl/i.test(String(t || ''))) S.hlsAsked = (S.hlsAsked || 0) + 1;
+          return origCPT.apply(this, arguments);
+        };
+      } catch (e) { S.errors.push('canPlayType: ' + e); }
       try {
         window.MediaSource = MS; window.ManagedMediaSource = MS; window.WebKitMediaSource = MS; window.SourceBuffer = SB;
       } catch (e) { S.errors.push('instalare: ' + e); }
@@ -233,11 +242,19 @@ enum FakeMSE {
       Object.defineProperty(HTMLMediaElement.prototype, 'src', {
         configurable: true,
         get: function(){ return this.__ppFake || desc.get.call(this); },
-        set: function(v){ if (!attach(this, v)) { this.__ppFake = null; desc.set.call(this, v); } }
+        set: function(v){
+          if (attach(this, v)) return;
+          // Flux HLS: în WebView-ul tvOS dă doar sunet → îl dăm player-ului Apple din aplicație.
+          if (/m3u8|\/manifest\/hls/i.test(String(v || ''))) { S.hls = String(v); toApp({t: 'hls', u: String(v)}); }
+          this.__ppFake = null; desc.set.call(this, v);
+        }
       });
       var origSetAttr = Element.prototype.setAttribute;
       Element.prototype.setAttribute = function(n, v){
-        if (this instanceof HTMLMediaElement && String(n).toLowerCase() === 'src' && attach(this, v)) return;
+        if (this instanceof HTMLMediaElement && String(n).toLowerCase() === 'src') {
+          if (attach(this, v)) return;
+          if (/m3u8|\/manifest\/hls/i.test(String(v || ''))) { S.hls = String(v); toApp({t: 'hls', u: String(v)}); }
+        }
         return origSetAttr.apply(this, arguments);
       };
 
@@ -427,9 +444,9 @@ enum FakeMSE {
           list.push(t[0]);
           S.net.ump[t[0]] = (S.net.ump[t[0]] || 0) + 1;
           if (t[0] === 21) media += z[0];
-          if (t[0] === 44 || t[0] === 47) {
-            var txt = ''; for (var i = p; i < Math.min(p + z[0], p + 120); i++) { var c = u8[i]; txt += (c >= 32 && c < 127) ? String.fromCharCode(c) : '.'; }
-            if (S.errors.length < 6) S.errors.push('UMP ' + t[0] + ': ' + txt);
+          if (t[0] === 44 || t[0] === 47 || t[0] === 58) {
+            var txt = ''; for (var i = p; i < Math.min(p + z[0], p + 60); i++) txt += ('0' + u8[i].toString(16)).slice(-2);
+            if (S.errors.length < 10) S.errors.push('UMP ' + t[0] + ': ' + txt);
           }
           p += z[0];
         }
@@ -480,6 +497,7 @@ enum FakeMSE {
       var q = '';
       try { q = mp && mp.getPlaybackQuality ? mp.getPlaybackQuality() : ''; } catch (e) {}
       o['MSE fals: ecran / calitate'] = (S.screenBefore || '?') + ' · cereri decodingInfo: ' + (S.di || 0) + ' · calitate curentă: ' + (q || '—') + ' · cerută: ' + (window.__ppQ || '—');
+      o['MSE fals: sursa <video>'] = fv ? (fv.__ppFake ? 'MediaSource fals' : String(fv.currentSrc || fv.getAttribute('src') || '—').replace(/\?.*/, '').slice(0, 80)) + ' · HLS cerut de pagină: ' + (S.hlsAsked || 0) : '—';
       o['MSE fals: total primit'] = S.appends + ' bucăți, ' + Math.round(S.bytes / 1024) + ' KB';
       o['MSE fals: cereri video'] = S.net.n + ' (ok ' + S.net.ok + ', eșuate ' + S.net.bad + ', coduri ' + JSON.stringify(S.net.codes) + ', SABR ' + S.net.sabr + ', pot ' + S.net.pot + ')';
       o['MSE fals: răspunsuri video'] = S.net.resp.join('\n') || '—';

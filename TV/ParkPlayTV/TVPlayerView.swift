@@ -97,11 +97,11 @@ struct TVPlayerView: View {
             else {
                 WebHost().ignoresSafeArea()
                 // Experimentul MediaSource fals: imaginea vine din redarea nativă, peste pagină.
-                if FakeMSE.enabled && !engine.mseFallback { MSEHost().ignoresSafeArea() }
+                if FakeMSE.enabled && !engine.mseFallback && engine.mseActive { MSEHost().ignoresSafeArea() }
             }
 
             // Subtitrările pe calea 1080p (imaginea e nativă, așa că le desenăm noi, cu textul din pagina YouTube).
-            if FakeMSE.enabled && !engine.nativeActive && !engine.mseFallback && engine.captionChoice != "off" && !engine.captionText.isEmpty {
+            if FakeMSE.enabled && !engine.nativeActive && !engine.mseFallback && engine.mseActive && engine.captionChoice != "off" && !engine.captionText.isEmpty {
                 Text(engine.captionText)
                     .font(.system(size: 40 * engine.captionSize, weight: .semibold))
                     .multilineTextAlignment(.center)

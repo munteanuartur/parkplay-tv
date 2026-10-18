@@ -250,6 +250,8 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
                     guard let self, !self.suspended, !self.nativeActive else { return }
                     let r = MSERenderer.shared
                     r.update()
+                    let active = r.bytesIn > 0
+                    if active != self.mseActive { self.mseActive = active }
                     if r.needsFreshInit {
                         r.needsFreshInit = false
                         self.bounceQuality()
@@ -265,6 +267,7 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
                     }
                     self.mseStats(r)
                     self.checkMSEFallback(r)
+                    self.checkPageHLS()
                     let clock = String(format: "window.__ppClock&&window.__ppClock(%.3f,%@);", r.currentTime, r.isPlaying ? "true" : "false")
                     // Subtitrările le desenează player-ul YouTube în pagină (sub imaginea nativă): le luăm ca text.
                     let cc = "(function(){var c=document.querySelector('.ytp-caption-window-container .caption-window, .ytp-caption-window-container, .caption-window');return c?(c.innerText||c.textContent||''):''})()"
@@ -389,6 +392,7 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
         loadToken += 1
         let token = loadToken
         webQualityOverride = nil
+        mseActive = false
         let wasFallback = mseFallback
         captionText = ""
         mseFallback = false
@@ -732,6 +736,7 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
     }
 
     private func stopNative() {
+        pageHLS = false
         stopVLC()
         choices = []
         currentChoice = ""
@@ -832,7 +837,7 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
         // Blocaj: buffer gol și player-ul așteaptă de prea mult → cerem adrese noi și continuăm.
         // Doar un blocaj adevărat: YouTube a refuzat o bucată (403) sau video-ul a mers deja aproape un minut.
         // (La pornire AVPlayer poate încărca și 5–10 s — asta nu e blocaj.)
-        let refused = netError.contains("403") || clock.position > 40
+        let refused = netError.contains("403") || (clock.position > 40 && !pageHLS)
         if wantPlay && !p && buf && buffer < 0.5 && refused {
             if stallSince == 0 { stallSince = self.now() }
             // YouTube dă clientului iOS doar ~primul minut din fiecare video (apoi HTTP 403, oricât am aștepta
@@ -1037,6 +1042,61 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
         return "Conectat: am pus \(cookies.count) cookie-uri YouTube pe Apple TV"
     }
 
+    // MARK: - HLS din pagina YouTube, redat nativ cu AVPlayer
+
+    /// Pe Apple TV-ul real YouTube îi dă paginii un flux HLS (până la 1080p). În WebView acesta dă doar sunet,
+    /// iar MediaSource-ul fals e oprit de protecția anti-bot — dar player-ul Apple îl redă direct, cu imagine.
+    private var pageHLS = false
+    private var hlsTried = ""
+    private var hlsCheckAt: TimeInterval = 0
+
+    private func checkPageHLS() {
+        guard !nativeActive, loaded, wantPlay, webHasContent, let t = current, hlsTried != t.id,
+              now() - hlsCheckAt > 1 else { return }
+        hlsCheckAt = now()
+        let id = t.id
+        let code = "(function(){try{var mp=document.getElementById('movie_player');var pr=mp&&mp.getPlayerResponse?mp.getPlayerResponse():null;" +
+            "if(!pr||!pr.videoDetails||pr.videoDetails.videoId!=='\(id)')pr=window.ytInitialPlayerResponse;" +
+            "if(!pr||!pr.videoDetails||pr.videoDetails.videoId!=='\(id)')return '';" +
+            "return (pr.streamingData&&pr.streamingData.hlsManifestUrl)||'';}catch(e){return ''}})()"
+        web?.evaluate(code) { [weak self] r, _ in
+            Task { @MainActor in
+                guard let self, let s = r as? String, !s.isEmpty, let url = URL(string: s),
+                      let cur = self.current, cur.id == id, self.hlsTried != id, !self.nativeActive else { return }
+                self.startPageHLS(url, id: id)
+            }
+        }
+    }
+
+    private func startPageHLS(_ url: URL, id: String) {
+        hlsTried = id
+        let pos = clock.position
+        MSERenderer.shared.reset()
+        mseActive = false
+        stopWebPage()
+        resetStats()
+        loadToken += 1
+        let token = loadToken
+        nativeActive = true
+        pageHLS = true
+        currentQuality = "auto"
+        buffering = true
+        diag.lastEvent = "HLS din pagina YouTube → player Apple (până la 1080p)"
+        let asset = AVURLAsset(url: url, options: ["AVURLAssetHTTPHeaderFieldsKey": ["User-Agent": siteMode.userAgent]])
+        let item = AVPlayerItem(asset: asset)
+        item.preferredForwardBufferDuration = 30
+        avPlayer.replaceCurrentItem(with: item)
+        Task { @MainActor in
+            if pos > 1 {
+                for _ in 0..<150 where item.status == .unknown { try? await Task.sleep(nanoseconds: 100_000_000) }
+                guard token == loadToken else { return }
+                if item.status == .readyToPlay { _ = await avPlayer.seek(to: CMTime(seconds: pos, preferredTimescale: 600)) }
+            }
+            guard token == loadToken else { return }
+            if wantPlay && !suspended { avPlayer.playImmediately(atRate: Float(rate)) }
+        }
+    }
+
     // MARK: - Calea 1080p (MediaSource fals + redare nativă): statistici și rezervă
 
     private var mseStatAt: TimeInterval = 0
@@ -1044,9 +1104,12 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
     private var mseStatFrames = 0
     /// Video-ul curent merge pe varianta simplă (pagina fără MediaSource fals, 360p).
     @Published private(set) var mseFallback = false
+    /// Player-ul YouTube chiar folosește MediaSource-ul fals (au venit date). Altfel pagina redă singură
+    /// (ex. HLS / fișier simplu) și imaginea ei trebuie să se vadă — nu acoperită de stratul nativ.
+    @Published private(set) var mseActive = false
 
     private func mseStats(_ r: MSERenderer) {
-        guard FakeMSE.enabled, !nativeActive, !mseFallback else { return }
+        guard FakeMSE.enabled, !nativeActive, !mseFallback, mseActive else { return }
         let t = now()
         let dt = t - mseStatAt
         guard dt >= 1 else { return }
@@ -1229,6 +1292,11 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
                 MSERenderer.shared.append(kind: m["k"] as? String ?? "v", data: data, offset: d("o"))
             }
             return
+        case "hls":
+            if let s = m["u"] as? String, let url = URL(string: s), let t = current, !nativeActive, hlsTried != t.id {
+                startPageHLS(url, id: t.id)
+            }
+            return
         case "mse-reset": MSERenderer.shared.reset(); return
         case "mse-play": MSERenderer.shared.play(); return
         case "mse-pause": MSERenderer.shared.pause(); return
@@ -1253,7 +1321,7 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
             currentQuality = m["c"] as? String ?? ""
         case "stats":
             if nativeActive { return }
-            if FakeMSE.enabled && !mseFallback { return } // le dă redarea nativă (mseStats)
+            if FakeMSE.enabled && !mseFallback && mseActive { return } // le dă redarea nativă (mseStats)
             diag.fps = max(0, d("fps"))
             diag.kbps = max(0, d("kbps"))
             diag.dropped = Int(d("dropped"))

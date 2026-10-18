@@ -54,6 +54,17 @@ final class MSERenderer {
         displayLayer.backgroundColor = UIColor.black.cgColor
         sync.addRenderer(displayLayer)
         sync.addRenderer(audioRenderer)
+        // Sesiunea audio a aplicației, activată explicit. Pe Apple TV-ul real, fără ea `setRate` rămâne
+        // blocat (sincronizatorul așteaptă ieșirea audio, ocupată de pagina web). Pe aceeași coadă, înainte de orice setRate.
+        syncQueue.async {
+            let session = AVAudioSession.sharedInstance()
+            do {
+                try session.setCategory(.playback, mode: .moviePlayback, options: [.mixWithOthers])
+                try session.setActive(true)
+            } catch {
+                NSLog("ParkPlayTV: sesiunea audio nu pornește: \(error)")
+            }
+        }
         displayLayer.requestMediaDataWhenReady(on: .main) { [weak self] in
             MainActor.assumeIsolated { self?.pump() }
         }
@@ -66,7 +77,18 @@ final class MSERenderer {
         let t = sync.currentTime().seconds
         return t.isFinite ? max(t, 0) : 0
     }
-    var isPlaying: Bool { sync.rate > 0 }
+    var isPlaying: Bool { rateNow > 0 }
+
+    /// Pe Apple TV-ul real `setRate` așteaptă după sistemul audio (zeci–sute de ms) și bloca tot firul
+    /// principal (telecomanda nu mai răspundea). Îl trimitem pe o coadă separată, în ordine.
+    private let syncQueue = DispatchQueue(label: "ParkPlayTV.sync", qos: .userInitiated)
+    private(set) var rateNow: Float = 0
+    private func setRate(_ r: Float, time: CMTime? = nil) {
+        if time == nil && r == rateNow { return }
+        rateNow = r
+        let s = sync
+        syncQueue.async { if let time { s.setRate(r, time: time) } else { s.rate = r } }
+    }
     var videoSize: CGSize { CGSize(width: video.width, height: video.height) }
 
     // MARK: - Comenzi (din pagină: play / pause / seek / reset)
@@ -74,7 +96,7 @@ final class MSERenderer {
     /// `keepFormats`: video nou în aceeași pagină — player-ul YouTube refolosește SourceBuffer-ele și
     /// poate să NU mai trimită antetul (moov) dacă formatul e același. Păstrăm formatul, golim restul.
     func reset(keepFormats: Bool = false) {
-        sync.rate = 0
+        setRate(0)
         displayLayer.flushAndRemoveImage()
         audioRenderer.flush()
         noFormatFragments = 0
@@ -91,7 +113,7 @@ final class MSERenderer {
         }
         bytesIn = 0
         ahead = 0
-        sync.setRate(0, time: .zero)
+        setRate(0, time: .zero)
         waiting = true
         wantPlay = false
     }
@@ -115,7 +137,7 @@ final class MSERenderer {
 
     func pause() {
         wantPlay = false
-        sync.rate = 0
+        setRate(0)
     }
 
     /// Derulare. `keep` = pagina crede că poziția e deja în buffer: o redăm din memorie, fără descărcare.
@@ -124,7 +146,7 @@ final class MSERenderer {
     func seek(_ t: Double, keep: Bool = false) -> Bool {
         displayLayer.flush()
         audioRenderer.flush()
-        sync.setRate(0, time: CMTime(seconds: max(t, 0), preferredTimescale: 90_000))
+        setRate(0, time: CMTime(seconds: max(t, 0), preferredTimescale: 90_000))
         waiting = true
         if keep,
            let vi = video.cache.lastIndex(where: { $0.key && $0.pts <= t + 0.001 }),
@@ -204,17 +226,15 @@ final class MSERenderer {
         guard #available(tvOS 18.0, *), video.frameDur > 0 else { return false }
         let pb = displayLayer.sampleBufferRenderer.displayedPixelBuffer()
         let obj = pb.map { $0 as AnyObject }
-        if let obj {
-            if let last = lastShown, obj === last { sameShown += 1 } else { sameShown = 0 }
-        } else if video.frames > 0 {
-            sameShown += 1   // nimic afișat deși au venit cadre
-        }
+        // Doar aceeași imagine, afișată continuu, înseamnă înghețare. Fără imagine raportată (pe unele
+        // dispozitive sistemul nu ne-o dă) nu tragem nicio concluzie — altfel am „repara” la nesfârșit.
+        if let obj, let last = lastShown, obj === last { sameShown += 1 } else { sameShown = 0 }
         lastShown = obj
         return sameShown >= 12   // ~3 s la 4 verificări pe secundă
     }
 
     private func checkVideoHealth() {
-        guard sync.rate > 0 else { stuckSince = 0; lastFrames = enqueuedVideo; sameShown = 0; return }
+        guard rateNow > 0 else { stuckSince = 0; lastFrames = enqueuedVideo; sameShown = 0; return }
         if imageFrozen() {
             sameShown = 0
             // Cauza obișnuită: video nou în aceeași pagină, cu alt antet H.264 decât cel păstrat, iar
@@ -272,15 +292,15 @@ final class MSERenderer {
         guard !active.isEmpty else { waiting = true; return }
         let ahead = (active.map { $0.lastEnd }.min() ?? 0) - t
         self.ahead = max(ahead, 0)
-        if sync.rate > 0 && ahead < 0.15 {
-            sync.rate = 0
+        if rateNow > 0 && ahead < 0.15 {
+            setRate(0)
             waiting = true
-        } else if sync.rate == 0 && wantPlay && ahead > 1.0 {
-            sync.rate = 1
+        } else if rateNow == 0 && wantPlay && ahead > 1.0 {
+            setRate(1)
             waiting = false
         }
-        info = String(format: "%@ · %.1f s · buffer %.1f s · cadre %d · %dx%d @%.0f fps · memorie %d MB",
-                      sync.rate > 0 ? "rulează" : (wantPlay ? "așteaptă date" : "pauză"),
+        info = String(format: "%@ · %.1f s · buffer %.1f s · cadre %ld · %ldx%ld @%.0f fps · memorie %ld MB",
+                      rateNow > 0 ? "rulează" : (wantPlay ? "așteaptă date" : "pauză"),
                       t, max(ahead, 0), video.frames, video.width, video.height,
                       video.frameDur > 0 ? 1 / video.frameDur : 0, (video.cacheBytes + audio.cacheBytes) >> 20)
     }
