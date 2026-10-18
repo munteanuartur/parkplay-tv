@@ -35,6 +35,8 @@ NS_ASSUME_NONNULL_BEGIN
 /// Toate cookie-urile din WebKit (pentru deconectarea contului YouTube).
 - (void)getCookies:(void (^)(NSArray<NSHTTPCookie *> *cookies))completion;
 - (void)deleteCookies:(NSArray<NSHTTPCookie *> *)cookies completion:(void (^)(void))completion NS_SWIFT_NAME(deleteCookies(_:completion:));
+/// Șterge tot ce a păstrat browserul (cookie-uri, stocare locală, cache) — ca un browser curat.
+- (void)clearAllData:(void (^)(void))completion;
 - (void)loadURL:(NSURL *)url;
 - (void)reload;
 - (void)evaluate:(NSString *)js completion:(nullable void (^)(id _Nullable result, NSError * _Nullable error))completion;

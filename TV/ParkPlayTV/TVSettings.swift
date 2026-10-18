@@ -50,6 +50,7 @@ struct TVSettingsView: View {
                     if engine.signedIn {
                         Button("Deconectează contul de pe Apple TV", role: .destructive) { engine.signOut() }
                     }
+                    Button("Browser curat: șterge toate datele paginii YouTube", role: .destructive) { engine.clearBrowserData() }
                 }
 
                 Section("Avansat") {

@@ -94,7 +94,11 @@ struct TVPlayerView: View {
             Color.black.ignoresSafeArea()
             if engine.useVLC { VLCHost().ignoresSafeArea() }
             else if engine.nativeActive { NativeHost().ignoresSafeArea() }
-            else { WebHost().ignoresSafeArea() }
+            else {
+                WebHost().ignoresSafeArea()
+                // Experimentul MediaSource fals: imaginea vine din redarea nativă, peste pagină.
+                if FakeMSE.enabled { MSEHost().ignoresSafeArea() }
+            }
 
             if engine.wantPlay && (engine.buffering || engine.extending) && !engine.playing {
                 ProgressView().scaleEffect(1.6)
@@ -405,10 +409,10 @@ struct LiveStats: View {
             row("Calitate", TVEngine.label(e.currentQuality.isEmpty ? "—" : e.currentQuality))
             if e.nativeActive {
                 if !e.netError.isEmpty { row("Eroare rețea", e.netError) }
-                if !d.lastEvent.isEmpty { Text(d.lastEvent).foregroundStyle(.secondary).lineLimit(2) }
             } else {
                 row("Reclame sărite", "\(d.adsSkipped)")
             }
+            if !d.lastEvent.isEmpty { Text(d.lastEvent).foregroundStyle(.secondary).lineLimit(3) }
             if !d.codecs.isEmpty { Text(d.codecs).foregroundStyle(.secondary).lineLimit(2) }
         }
         .font(.system(size: 24, design: .monospaced))
@@ -427,6 +431,7 @@ struct LiveStats: View {
 /// Ce poate WebKit-ul de pe acest Apple TV + setări de test (site, calitate, SponsorBlock, Autoplay).
 struct DiagnosticsView: View {
     @ObservedObject private var engine = TVEngine.shared
+    @AppStorage("fake_mse") private var fakeMSE = false
     @ObservedObject private var d = TVEngine.shared.diag
 
     /// Video de test 4K (natură, fără muzică).
@@ -441,11 +446,18 @@ struct DiagnosticsView: View {
                     line("Filtru de reclame", d.adRules)
                     line("Ultimul eveniment", d.lastEvent.isEmpty ? "—" : d.lastEvent)
                 }
+                // Experimentul MediaSource fals: sus, ca să se vadă fără derulare.
+                let mse = d.page.keys.filter { $0.hasPrefix("MSE fals") }.sorted()
+                if !mse.isEmpty {
+                    group("Experiment: MediaSource fals") {
+                        ForEach(mse, id: \.self) { k in line(String(k.dropFirst("MSE fals: ".count)), d.page[k] ?? "") }
+                    }
+                }
                 group("Pagina YouTube (după ce pornești un video)") {
                     if d.page.isEmpty {
                         Text("Pornește un video, apoi apasă „Verifică din nou”.").foregroundStyle(.secondary)
                     }
-                    ForEach(d.page.keys.sorted(), id: \.self) { k in line(k, d.page[k] ?? "") }
+                    ForEach(d.page.keys.filter { !$0.hasPrefix("MSE fals") }.sorted(), id: \.self) { k in line(k, d.page[k] ?? "") }
                 }
                 HStack(spacing: 30) {
                     Button("▶  Video de test 4K") { TVAppState.shared.play([testVideo], 0) }
@@ -455,6 +467,7 @@ struct DiagnosticsView: View {
                     Picker("Site", selection: $engine.siteMode) {
                         ForEach(TVEngine.SiteMode.allCases) { m in Text(m.title).tag(m) }
                     }
+                    Toggle("Experiment: MediaSource fals (repornește aplicația după schimbare)", isOn: $fakeMSE)
                     Toggle("SponsorBlock (sare peste intro, reclame citite)", isOn: $engine.sponsorBlock)
                     Toggle("Autoplay (continuă cu video-uri asemănătoare)", isOn: $engine.autoplay)
                 }
@@ -478,9 +491,11 @@ struct DiagnosticsView: View {
     private func line(_ k: String, _ v: String) -> some View {
         HStack(alignment: .top) {
             Text(k).foregroundStyle(.secondary).frame(width: 420, alignment: .leading)
-            Text(v).lineLimit(3)
+            Text(v).lineLimit(8)
         }
         .font(.callout)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .focusable()   // ca telecomanda să poată derula și peste rândurile de text
     }
 }
 

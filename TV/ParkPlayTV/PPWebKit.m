@@ -20,6 +20,8 @@
 - (void)deleteCookie:(NSHTTPCookie *)cookie completionHandler:(void (^)(void))completionHandler;
 - (void)compileContentRuleListForIdentifier:(NSString *)identifier encodedContentRuleList:(NSString *)encodedContentRuleList completionHandler:(void (^)(id, NSError *))completionHandler;
 + (instancetype)defaultStore;
++ (NSSet<NSString *> *)allWebsiteDataTypes;
+- (void)removeDataOfTypes:(NSSet<NSString *> *)types modifiedSince:(NSDate *)date completionHandler:(void (^)(void))completionHandler;
 + (instancetype)storeWithURL:(NSURL *)url;
 @end
 
@@ -100,6 +102,13 @@ static void PPSet(id obj, id value, NSString *key) {
     PPSet(config, @YES, @"allowsInlineMediaPlayback");
     PPSet(config, @0, @"mediaTypesRequiringUserActionForPlayback"); // fără atingere pentru redare
     PPSet(config, @YES, @"allowsAirPlayForMediaPlayback");
+    // Pagina nu e „ascunsă”: fără frânarea temporizatoarelor JavaScript (player-ul YouTube are nevoie de ele).
+    @try {
+        id prefs = [config valueForKey:@"preferences"];
+        PPSet(prefs, @NO, @"_hiddenPageDOMTimerThrottlingEnabled");
+        PPSet(prefs, @NO, @"_hiddenPageDOMTimerThrottlingAutoIncreases");
+        PPSet(prefs, @NO, @"_pageVisibilityBasedProcessSuppressionEnabled");
+    } @catch (__unused NSException *e) {}
     [_userContent addScriptMessageHandler:_handler name:@"pp"];
 
     UIView *wv = (UIView *)[[NSClassFromString(@"WKWebView") alloc] initWithFrame:frame configuration:config];
@@ -189,6 +198,17 @@ static void PPSet(id obj, id value, NSString *key) {
         [store setCookie:c completionHandler:^{ dispatch_group_leave(g); }];
     }
     dispatch_group_notify(g, dispatch_get_main_queue(), completion);
+}
+
+- (void)clearAllData:(void (^)(void))completion {
+    id dataStore = nil;
+    @try { dataStore = [[_view valueForKey:@"configuration"] valueForKey:@"websiteDataStore"]; } @catch (__unused NSException *e) {}
+    Class storeClass = NSClassFromString(@"WKWebsiteDataStore");
+    if (!dataStore || !storeClass) { completion(); return; }
+    NSSet *types = [storeClass allWebsiteDataTypes];
+    [dataStore removeDataOfTypes:types modifiedSince:[NSDate distantPast] completionHandler:^{
+        dispatch_async(dispatch_get_main_queue(), completion);
+    }];
 }
 
 - (void)loadURL:(NSURL *)url { [_view loadRequest:[NSURLRequest requestWithURL:url]]; }

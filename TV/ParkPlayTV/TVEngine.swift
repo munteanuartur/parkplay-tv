@@ -39,19 +39,30 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
     static let shared = TVEngine()
 
     enum SiteMode: String, CaseIterable, Identifiable {
-        case desktop, mobile
+        case desktop, mobile, mobile18, ipad
         var id: String { rawValue }
-        var title: String { self == .desktop ? "Desktop (www, până la 4K)" : "Mobil (m.youtube, HLS)" }
+        var title: String {
+            switch self {
+            case .desktop: return "Desktop (www, până la 4K — cere MediaSource)"
+            case .mobile: return "Mobil (m.youtube, HLS, iPhone iOS 16)"
+            case .mobile18: return "Mobil (m.youtube, HLS, iPhone iOS 18)"
+            case .ipad: return "iPad (Safari iPadOS 18)"
+            }
+        }
         var userAgent: String {
             switch self {
             case .desktop:
                 return "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
             case .mobile:
                 return "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
+            case .mobile18:
+                return "Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1"
+            case .ipad:
+                return "Mozilla/5.0 (iPad; CPU OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1"
             }
         }
         func url(_ id: String, start: Int) -> String {
-            let host = self == .desktop ? "https://www.youtube.com" : "https://m.youtube.com"
+            let host = (self == .desktop || self == .ipad) ? "https://www.youtube.com" : "https://m.youtube.com"
             return "\(host)/watch?v=\(id)" + (start > 5 ? "&t=\(start)s" : "")
         }
     }
@@ -98,11 +109,11 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
     enum PlayerMode: String, CaseIterable, Identifiable {
         case native, web
         var id: String { rawValue }
-        var title: String { self == .native ? "Nativ (AVPlayer, până la 1080p)" : "Pagina YouTube (WebView)" }
+        var title: String { self == .native ? "Nativ (experimental — YouTube îl poate bloca)" : "Pagina YouTube (recomandat)" }
     }
     @Published var playerMode: PlayerMode {
         didSet {
-            UserDefaults.standard.set(playerMode.rawValue, forKey: "player_mode")
+            UserDefaults.standard.set(playerMode.rawValue, forKey: "player_mode2")
             if index >= 0 && loaded && oldValue != playerMode { playIndex(index, start: clock.position) }
         }
     }
@@ -210,7 +221,9 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
         autoplay = d.object(forKey: "autoplay") as? Bool ?? true
         captionChoice = d.string(forKey: "captions") ?? "off"
         captionSize = d.object(forKey: "cc_size") as? Double ?? 1.0
-        playerMode = PlayerMode(rawValue: d.string(forKey: "player_mode") ?? "") ?? .native
+        // Implicit: pagina YouTube (clientul iOS al căii native e limitat / blocat de YouTube).
+        // Cheie nouă, ca să pornească toți de pe pagina YouTube; nativul rămâne opțiune în Setări.
+        playerMode = PlayerMode(rawValue: d.string(forKey: "player_mode2") ?? "") ?? .web
         super.init()
         restoreSession()
         setupWebView()
@@ -228,6 +241,19 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
             return
         }
         web = w
+        if FakeMSE.enabled {
+            w.addDocumentStartScript(FakeMSE.script, mainFrameOnly: true)
+            // Ceasul <video>-ului simulat îl mișcăm din aplicație (temporizatoarele paginii sunt frânate).
+            Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+                Task { @MainActor in
+                    guard let self, !self.suspended, !self.nativeActive else { return }
+                    let r = MSERenderer.shared
+                    r.update()
+                    let clock = String(format: "window.__ppClock&&window.__ppClock(%.3f,%@);", r.currentTime, r.isPlaying ? "true" : "false")
+                    self.web?.evaluate(clock + "window.__ppTick&&window.__ppTick()", completion: nil)
+                }
+            }
+        }
         w.addDocumentStartScript(PageScripts.adBlock, mainFrameOnly: false)
         w.addDocumentStartScript(PageScripts.bridge, mainFrameOnly: true)
         let year = Date().addingTimeInterval(3600 * 24 * 365)
@@ -324,6 +350,11 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
             Task { @MainActor in
                 let ok = await startNative(t.id, start: start, token: token)
                 if !ok && token == loadToken { fallbackToWeb(u) }
+            }
+            // Plasă de siguranță: dacă în 26 s nu s-a redat nimic, trecem pe pagina YouTube.
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 26_000_000_000)
+                if token == loadToken { checkNativeStartTimeout() }
             }
         } else {
             stopNative()
@@ -659,6 +690,7 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
     }
 
     private func nativeTick() {
+        checkNativeStartTimeout()
         guard nativeActive, let it = avPlayer.currentItem else { return }
         if it.status == .failed {
             let msg = it.error?.localizedDescription ?? "eroare"
@@ -695,12 +727,15 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
             netError = "HTTP \(e.errorStatusCode)" + (e.errorComment.map { " — " + $0 } ?? "")
         }
         // Blocaj: buffer gol și player-ul așteaptă de prea mult → cerem adrese noi și continuăm.
-        if wantPlay && !p && buf && buffer < 0.5 {
+        // Doar un blocaj adevărat: YouTube a refuzat o bucată (403) sau video-ul a mers deja aproape un minut.
+        // (La pornire AVPlayer poate încărca și 5–10 s — asta nu e blocaj.)
+        let refused = netError.contains("403") || clock.position > 40
+        if wantPlay && !p && buf && buffer < 0.5 && refused {
             if stallSince == 0 { stallSince = self.now() }
             // YouTube dă clientului iOS doar ~primul minut din fiecare video (apoi HTTP 403, oricât am aștepta
             // sau oricâte adrese noi am cere — testat cu tools/probe-youtube.py --time). Când se termină,
             // continuăm pe pagina YouTube de la aceeași secundă, ca să nu se oprească video-ul.
-            if self.now() - stallSince > 4, let t = current,
+            if self.now() - stallSince > 3, let t = current,
                let u = URL(string: siteMode.url(t.id, start: Int(clock.position))) {
                 stallSince = 0
                 diag.lastEvent = "nativ oprit de YouTube (\(netError.isEmpty ? "fără date" : netError)) → continui pe pagina YouTube"
@@ -709,6 +744,14 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
         } else {
             stallSince = 0
         }
+    }
+
+    /// Pornirea nativă a durat prea mult (nimic redat în 25 s) → pagina YouTube.
+    private func checkNativeStartTimeout() {
+        guard nativeActive, !useVLC, wantPlay, clock.position < 1, now() - loadedAt > 25,
+              let t = current, let u = URL(string: siteMode.url(t.id, start: 0)) else { return }
+        diag.lastEvent = "nativ: nu pornește în 25 s (\(netError.isEmpty ? "fără date" : netError)) → pagina YouTube"
+        fallbackToWeb(u)
     }
 
     private var stallSince: TimeInterval = 0
@@ -799,6 +842,19 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
                 if let s = r as? String, let d = s.data(using: .utf8),
                    let o = try? JSONSerialization.jsonObject(with: d) as? [String: String] {
                     self.diag.page = o
+                    if FakeMSE.enabled {
+                        self.web?.evaluate(FakeMSE.reportJS) { r2, _ in
+                            Task { @MainActor in
+                                if let s2 = r2 as? String, let d2 = s2.data(using: .utf8),
+                                   let o2 = try? JSONSerialization.jsonObject(with: d2) as? [String: String] {
+                                    self.diag.page.merge(o2) { _, b in b }
+                                    self.diag.page["MSE fals: redare nativă"] = MSERenderer.shared.info
+                                    // Și în consola Xcode (se poate copia de acolo).
+                                    for k in o2.keys.sorted() { NSLog("ParkPlayTV %@ = %@", k, o2[k] ?? "") }
+                                }
+                            }
+                        }
+                    }
                 } else {
                     self.diag.page = ["Eroare": err?.localizedDescription ?? "pagina nu răspunde"]
                 }
@@ -886,6 +942,27 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
         }
     }
 
+    /// „Browser curat”: șterge cookie-urile, stocarea și cache-ul paginii YouTube (inclusiv contul),
+    /// apoi pune la loc doar consimțământul pentru cookie-uri. Video-ul curent se reîncarcă.
+    func clearBrowserData() {
+        signedIn = false
+        UserDefaults.standard.set(false, forKey: "yt_signed_in")
+        guard let w = web else { return }
+        w.clearAllData {
+            let year = Date().addingTimeInterval(3600 * 24 * 365)
+            let consent = [
+                HTTPCookie(properties: [.name: "SOCS", .value: "CAI", .domain: ".youtube.com", .path: "/", .secure: "TRUE", .expires: year]),
+                HTTPCookie(properties: [.name: "CONSENT", .value: "YES+1", .domain: ".youtube.com", .path: "/", .expires: year]),
+            ].compactMap { $0 }
+            w.setCookies(consent) {
+                Task { @MainActor in
+                    self.diag.lastEvent = "datele browserului șterse (browser curat)"
+                    if self.loaded && self.index >= 0 { self.playIndex(self.index, start: self.clock.position) }
+                }
+            }
+        }
+    }
+
     func signOut() {
         signedIn = false
         UserDefaults.standard.set(false, forKey: "yt_signed_in")
@@ -966,6 +1043,7 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
         if ready { web?.load(URL(string: "about:blank")!) }
         webHasContent = false
         stopNative()
+        MSERenderer.shared.reset()
         loaded = false
         if queue.indices.contains(index) { clock.position = WatchPositions.resumePoint(queue[index].id) ?? clock.position }
         StatsStore.flush()
@@ -1005,6 +1083,19 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
     private func receive(_ m: [String: Any]) {
         func d(_ k: String) -> Double { (m[k] as? NSNumber)?.doubleValue ?? 0 }
         func b(_ k: String) -> Bool { (m[k] as? NSNumber)?.boolValue ?? false }
+        // Bucățile și comenzile MediaSource-ului fals (redare nativă a paginii YouTube).
+        switch m["t"] as? String {
+        case "mse":
+            if let s = m["d"] as? String, let data = Data(base64Encoded: s) {
+                MSERenderer.shared.append(kind: m["k"] as? String ?? "v", data: data, offset: d("o"))
+            }
+            return
+        case "mse-reset": MSERenderer.shared.reset(); return
+        case "mse-play": MSERenderer.shared.play(); return
+        case "mse-pause": MSERenderer.shared.pause(); return
+        case "mse-seek": MSERenderer.shared.seek(d("time")); return
+        default: break
+        }
         if nativeActive && m["t"] as? String != "stats" { return } // pagina veche nu mai comandă
         switch m["t"] as? String {
         case "state":

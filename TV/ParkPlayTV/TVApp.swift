@@ -165,6 +165,22 @@ struct TVShelf: View {
 }
 
 struct TVCard: View {
+    /// „1,2 mil. de vizionări”, ca pe YouTube în română.
+    static func viewsText(_ v: Int64) -> String {
+        guard v >= 0 else { return "" }
+        func one(_ x: Double) -> String {
+            let s = String(format: x < 10 ? "%.1f" : "%.0f", x).replacingOccurrences(of: ".", with: ",")
+            return s.hasSuffix(",0") ? String(s.dropLast(2)) : s
+        }
+        switch v {
+        case 1_000_000_000...: return one(Double(v) / 1e9) + " mld. de vizionări"
+        case 1_000_000...: return one(Double(v) / 1e6) + " mil. de vizionări"
+        case 1_000...: return one(Double(v) / 1e3) + " K vizionări"
+        case 1: return "1 vizionare"
+        default: return "\(v) vizionări"
+        }
+    }
+
     let track: Track
     var width: CGFloat = 400
     var removeTitle: String? = nil
@@ -209,9 +225,14 @@ struct TVCard: View {
             .buttonStyle(.card)
             .contextMenu { TVTrackMenu(track: track, removeTitle: removeTitle, onRemove: onRemove) }
             Text(track.title).font(.callout).lineLimit(2).frame(width: width, alignment: .leading)
-            Text([track.channel, track.published].filter { !$0.isEmpty }.joined(separator: " · "))
+            Text(track.channel)
                 .font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 .frame(width: width, alignment: .leading)
+            let meta = [TVCard.viewsText(track.views), track.published].filter { !$0.isEmpty }.joined(separator: " · ")
+            if !meta.isEmpty {
+                Text(meta).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    .frame(width: width, alignment: .leading)
+            }
         }
     }
 }
@@ -411,57 +432,141 @@ struct TVSearchView: View {
     @State private var results: [Track] = []
     @State private var status = ""
     @State private var task: Task<Void, Never>?
+    @State private var suggestTask: Task<Void, Never>?
+    @State private var suggestions: [String] = []
     @State private var filters = YouTubeSearch.Filters()
+
+    /// Tastatura pe ecran (ca în aplicația YouTube de Apple TV): 6 coloane.
+    private let keys: [String] = Array("abcdefghijklmnopqrstuvwxyz1234567890").map(String.init) + ["ă", "â", "î", "ș", "ț", "-"]
 
     var body: some View {
         NavigationStack {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 30) {
-                    ScrollView(.horizontal) {
-                        HStack(spacing: 20) {
-                            filterButton("Oricând", .init(upload: 0, sort: filters.sort))
-                            filterButton("Azi", .init(upload: YouTubeSearch.uploadToday, sort: filters.sort))
-                            filterButton("Săptămâna asta", .init(upload: YouTubeSearch.uploadWeek, sort: filters.sort))
-                            filterButton("Luna asta", .init(upload: YouTubeSearch.uploadMonth, sort: filters.sort))
-                            filterButton("Ultimul an", .init(upload: YouTubeSearch.uploadYear, sort: filters.sort))
-                            filterButton("🕘 Cele mai noi", .init(upload: filters.upload, sort: filters.sort == YouTubeSearch.sortDate ? 0 : YouTubeSearch.sortDate, maxAgeDays: filters.maxAgeDays))
-                            filterButton("🔥 Cele mai vizionate", .init(upload: filters.upload, sort: filters.sort == YouTubeSearch.sortViews ? 0 : YouTubeSearch.sortViews, maxAgeDays: filters.maxAgeDays))
-                        }
-                        .padding(.vertical, 20)
+            HStack(alignment: .top, spacing: 50) {
+                // Stânga: câmpul, tastatura, sugestiile / căutările recente
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 24) {
+                        // Câmpul: click = tastatura sistemului (dictare, telefonul ca tastatură)
+                        TextField("Caută pe YouTube", text: $query)
+                            .font(.title3)
+                            .submitLabel(.search)
+                            .onSubmit { search(query, delay: false) }
+                        keyboard
+                        suggestionList
                     }
-                    .scrollClipDisabled()
-                    .focusSection()
+                    .padding(.vertical, 20)
+                }
+                .frame(width: 600)
+                .scrollClipDisabled()
+                .focusSection()
 
-                    if !status.isEmpty { Text(status).foregroundStyle(.secondary) }
-                    if query.trimmingCharacters(in: .whitespaces).count < 2 {
-                        let recents = Library.recentSearches
-                        if !recents.isEmpty {
-                            Text("Căutări recente").font(.title3.bold())
+                // Dreapta: filtre + rezultate
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 30) {
+                        if query.trimmingCharacters(in: .whitespaces).count < 2 {
+                            Text("Scrie ce cauți — rezultatele apar aici pe măsură ce tastezi.")
+                                .foregroundStyle(.secondary)
+                            TVCategories()
+                        } else {
                             ScrollView(.horizontal) {
                                 HStack(spacing: 20) {
-                                    ForEach(recents.prefix(10), id: \.self) { q in Button(q) { query = q } }
+                                    filterButton("Oricând", .init(upload: 0, sort: filters.sort))
+                                    filterButton("Azi", .init(upload: YouTubeSearch.uploadToday, sort: filters.sort))
+                                    filterButton("Săptămâna asta", .init(upload: YouTubeSearch.uploadWeek, sort: filters.sort))
+                                    filterButton("Luna asta", .init(upload: YouTubeSearch.uploadMonth, sort: filters.sort))
+                                    filterButton("Ultimul an", .init(upload: YouTubeSearch.uploadYear, sort: filters.sort))
+                                    filterButton("🕘 Cele mai noi", .init(upload: filters.upload, sort: filters.sort == YouTubeSearch.sortDate ? 0 : YouTubeSearch.sortDate, maxAgeDays: filters.maxAgeDays))
+                                    filterButton("🔥 Cele mai vizionate", .init(upload: filters.upload, sort: filters.sort == YouTubeSearch.sortViews ? 0 : YouTubeSearch.sortViews, maxAgeDays: filters.maxAgeDays))
                                 }
                                 .padding(.vertical, 20)
                             }
                             .scrollClipDisabled()
                             .focusSection()
-                        }
-                        TVCategories()
-                    } else {
-                        if !results.isEmpty {
-                            HStack(spacing: 30) {
-                                Button { Library.addRecentSearch(query); TVAppState.shared.play(results, 0) } label: { Label("Redă tot", systemImage: "play.fill") }
-                                Button { TVAppState.shared.play(results.shuffled(), 0) } label: { Label("Amestecă", systemImage: "shuffle") }
+                            if !status.isEmpty { Text(status).foregroundStyle(.secondary) }
+                            LazyVGrid(columns: [GridItem(.adaptive(minimum: 400), spacing: 40)], alignment: .leading, spacing: 50) {
+                                ForEach(Array(results.enumerated()), id: \.offset) { i, t in
+                                    TVCard(track: t, width: 400) {
+                                        Library.addRecentSearch(query.trimmingCharacters(in: .whitespaces))
+                                        TVAppState.shared.play(results, i)
+                                    }
+                                }
                             }
                             .focusSection()
                         }
-                        TVGrid(tracks: results)
+                    }
+                    .padding(.vertical, 20)
+                }
+                .scrollClipDisabled()
+            }
+            .padding(.horizontal, 60)
+            .onChange(of: query) { _, q in
+                search(q)
+                suggest(q)
+            }
+        }
+    }
+
+    // MARK: Tastatura
+
+    private var keyboard: some View {
+        VStack(spacing: 14) {
+            LazyVGrid(columns: Array(repeating: GridItem(.fixed(80), spacing: 14), count: 6), spacing: 14) {
+                ForEach(keys, id: \.self) { k in
+                    Button { query += k } label: {
+                        Text(k).font(.title3.weight(.medium)).frame(width: 52, height: 40)
+                    }
+                    .buttonStyle(.bordered)
+                }
+            }
+            HStack(spacing: 14) {
+                Button { query += " " } label: { Label("Spațiu", systemImage: "space").frame(maxWidth: .infinity) }
+                Button { if !query.isEmpty { query.removeLast() } } label: {
+                    Image(systemName: "delete.left").frame(width: 70)
+                }
+                Button { query = "" } label: { Text("Șterge").frame(width: 120) }
+            }
+            .buttonStyle(.bordered)
+        }
+    }
+
+    // MARK: Sugestii (ca la YouTube) / căutări recente
+
+    @ViewBuilder
+    private var suggestionList: some View {
+        let empty = query.trimmingCharacters(in: .whitespaces).isEmpty
+        let items = empty ? Array(Library.recentSearches.prefix(8)) : suggestions
+        if !items.isEmpty {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(empty ? "Căutări recente" : "Sugestii").font(.headline).foregroundStyle(.secondary)
+                ForEach(items, id: \.self) { q in
+                    Button {
+                        query = q
+                        search(q, delay: false)
+                    } label: {
+                        Label(q, systemImage: empty ? "clock.arrow.circlepath" : "magnifyingglass")
+                            .lineLimit(1)
+                            .frame(maxWidth: .infinity, alignment: .leading)
                     }
                 }
-                .padding(.horizontal, 60)
             }
-            .searchable(text: $query, prompt: "Artist, piesă, playlist…")
-            .onChange(of: query) { _, q in search(q) }
+        }
+    }
+
+    /// Sugestiile de completare ale YouTube (același serviciu ca în aplicație).
+    private func suggest(_ q: String) {
+        suggestTask?.cancel()
+        let text = q.trimmingCharacters(in: .whitespaces)
+        guard !text.isEmpty else { suggestions = []; return }
+        suggestTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            guard !Task.isCancelled else { return }
+            var c = URLComponents(string: "https://suggestqueries-clients6.youtube.com/complete/search")!
+            c.queryItems = [.init(name: "client", value: "firefox"), .init(name: "ds", value: "yt"),
+                            .init(name: "hl", value: "ro"), .init(name: "gl", value: "RO"), .init(name: "q", value: text)]
+            guard let u = c.url, let res = try? await URLSession.shared.data(from: u),
+                  let a = try? JSONSerialization.jsonObject(with: res.0) as? [Any], a.count > 1,
+                  let list = a[1] as? [String] else { return }
+            guard !Task.isCancelled else { return }
+            suggestions = Array(list.prefix(8))
         }
     }
 
@@ -475,19 +580,19 @@ struct TVSearchView: View {
         }
     }
 
-    private func search(_ q: String) {
+    private func search(_ q: String, delay: Bool = true) {
         task?.cancel()
         let text = q.trimmingCharacters(in: .whitespaces)
         guard text.count >= 2 else { results = []; status = ""; return }
         let f = filters
         task = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 700_000_000)
+            if delay { try? await Task.sleep(nanoseconds: 700_000_000) }
             guard !Task.isCancelled else { return }
             status = "Caut „\(text)”…"
             let out = await YouTubeSearch.searchDetailed(text, limit: 40, filters: f)
             guard !Task.isCancelled else { return }
             results = out.tracks
-            if !out.tracks.isEmpty { Library.addRecentSearch(text) }
+            if !out.tracks.isEmpty && !delay { Library.addRecentSearch(text) }
             switch out.problem {
             case .none: status = ""
             case .network: status = "Fără internet sau YouTube nu răspunde"
