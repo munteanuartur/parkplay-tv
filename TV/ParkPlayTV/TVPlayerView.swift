@@ -403,7 +403,12 @@ struct LiveStats: View {
             row("Buffer", String(format: "%.1f s", d.buffer))
             row("Video", d.videoSize)
             row("Calitate", TVEngine.label(e.currentQuality.isEmpty ? "—" : e.currentQuality))
-            row("Reclame sărite", "\(d.adsSkipped)")
+            if e.nativeActive {
+                if !e.netError.isEmpty { row("Eroare rețea", e.netError) }
+                if !d.lastEvent.isEmpty { Text(d.lastEvent).foregroundStyle(.secondary).lineLimit(2) }
+            } else {
+                row("Reclame sărite", "\(d.adsSkipped)")
+            }
             if !d.codecs.isEmpty { Text(d.codecs).foregroundStyle(.secondary).lineLimit(2) }
         }
         .font(.system(size: 24, design: .monospaced))

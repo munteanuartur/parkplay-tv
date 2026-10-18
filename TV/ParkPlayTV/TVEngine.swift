@@ -317,6 +317,8 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
             stopVLC()
             choices = []
             currentChoice = ""
+            resetStats()
+            stallRecoveries = 0
             nativeActive = true
             diag.lastEvent = "încarc \(t.id) (nativ)"
             Task { @MainActor in
@@ -490,6 +492,11 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
 
     /// true = pornit nativ (sau cererea a fost depășită de alt video); false = trebuie pagina YouTube.
     private func startNative(_ id: String, start: Double, token: Int) async -> Bool {
+        // Fără „PO token”, YouTube dă clientului iOS doar ~primul minut: mai departe nu are rost.
+        if start > 50 {
+            diag.lastEvent = "nativ: YouTube dă doar primul minut → pagina YouTube de la \(Int(start)) s"
+            return false
+        }
         let r: NativeStreams.Result
         if let c = lastStreams, c.id == id, !c.result.formats.isEmpty {
             r = c.result
@@ -592,7 +599,10 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
         onState(playing: p, pos: max(pos, 0), dur: max(dur, 0), ad: false, buf: !p && wantPlay, native: true)
         let s = vlc.videoSize
         diag.videoSize = s.width > 0 ? "\(Int(s.width))×\(Int(s.height))" : "—"
-        if let m = vlc.media { diag.dropped = Int(m.numberOfLostPictures) }
+        if let m = vlc.media {
+            sampleStats(bytes: Int64(m.numberOfReadBytesOnInput), fps: nil, displayed: Int(m.numberOfDisplayedPictures),
+                        dropped: Int(m.numberOfLostPictures), estimatedFrames: 0, buffer: 0, stream: nil)
+        }
     }
     #endif
 
@@ -612,6 +622,7 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
         let token = loadToken
         let pos = clock.position
         buffering = true
+        resetStats()
         Task { @MainActor in
             let ok = await startNative(t.id, start: pos, token: token)
             if !ok && token == loadToken, let u = URL(string: siteMode.url(t.id, start: Int(pos))) { fallbackToWeb(u) }
@@ -663,10 +674,81 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
         onState(playing: p, pos: pos.isFinite ? pos : 0, dur: dur.isFinite ? dur : 0, ad: false, buf: buf, native: true)
         let s = it.presentationSize
         diag.videoSize = s.width > 0 ? "\(Int(s.width))×\(Int(s.height))" : "—"
-        if let e = it.accessLog()?.events.last {
-            diag.kbps = max(e.observedBitrate, 0) / 1000
-            diag.dropped = max(e.numberOfDroppedVideoFrames, 0)
+        // Statistici live (o dată pe secundă): traficul din octeții primiți, nu media din jurnal.
+        let events = it.accessLog()?.events ?? []
+        let bytes = events.reduce(Int64(0)) { $0 + max($1.numberOfBytesTransferred, 0) }
+        let watched = events.reduce(0.0) { $0 + max($1.durationWatched, 0) }
+        let dropped = events.reduce(0) { $0 + max($1.numberOfDroppedVideoFrames, 0) }
+        let fps = Double(it.tracks.first { $0.assetTrack?.mediaType == .video }?.currentVideoFrameRate ?? 0)
+        var buffer = 0.0
+        let now = avPlayer.currentTime()
+        for v in it.loadedTimeRanges {
+            let r = v.timeRangeValue
+            if r.start <= now && now <= r.end { buffer = (r.end - now).seconds }
         }
+        sampleStats(bytes: bytes, fps: fps > 0 ? fps : nil, displayed: nil, dropped: dropped,
+                    estimatedFrames: Int(watched * max(fps, 0)), buffer: buffer,
+                    stream: (events.last?.indicatedBitrate).map { $0 / 1e6 })
+
+        // Erorile de rețea ale player-ului (ex. YouTube refuză o bucată: HTTP 403).
+        if let e = it.errorLog()?.events.last {
+            netError = "HTTP \(e.errorStatusCode)" + (e.errorComment.map { " — " + $0 } ?? "")
+        }
+        // Blocaj: buffer gol și player-ul așteaptă de prea mult → cerem adrese noi și continuăm.
+        if wantPlay && !p && buf && buffer < 0.5 {
+            if stallSince == 0 { stallSince = self.now() }
+            // YouTube dă clientului iOS doar ~primul minut din fiecare video (apoi HTTP 403, oricât am aștepta
+            // sau oricâte adrese noi am cere — testat cu tools/probe-youtube.py --time). Când se termină,
+            // continuăm pe pagina YouTube de la aceeași secundă, ca să nu se oprească video-ul.
+            if self.now() - stallSince > 4, let t = current,
+               let u = URL(string: siteMode.url(t.id, start: Int(clock.position))) {
+                stallSince = 0
+                diag.lastEvent = "nativ oprit de YouTube (\(netError.isEmpty ? "fără date" : netError)) → continui pe pagina YouTube"
+                fallbackToWeb(u)
+            }
+        } else {
+            stallSince = 0
+        }
+    }
+
+    private var stallSince: TimeInterval = 0
+    private var stallRecoveries = 0
+    /// Ultima eroare de rețea a player-ului nativ (pentru panoul de statistici).
+    @Published private(set) var netError = ""
+
+    private var statAt: TimeInterval = 0
+    private var statBytes: Int64 = -1
+    private var statShown = -1
+
+    /// Trafic, FPS, cadre și buffer din contoarele player-ului — recalculate o dată pe secundă.
+    private func sampleStats(bytes: Int64, fps: Double?, displayed: Int?, dropped: Int, estimatedFrames: Int,
+                             buffer: Double, stream: Double?) {
+        let t = now()
+        let dt = t - statAt
+        guard statAt == 0 || dt >= 1 else { return }
+        if statAt > 0, statBytes >= 0, bytes >= statBytes { diag.kbps = Double(bytes - statBytes) * 8 / 1000 / dt }
+        if let fps { diag.fps = fps }
+        if let d = displayed {
+            if statShown >= 0, d >= statShown, statAt > 0 { diag.fps = Double(d - statShown) / dt }
+            statShown = d
+            diag.frames = d + dropped
+        } else {
+            diag.frames = estimatedFrames + dropped
+        }
+        diag.dropped = dropped
+        diag.buffer = max(buffer, 0)
+        if let stream, stream > 0 { diag.connection = String(format: "flux %.1f Mbit/s", stream) }
+        statAt = t
+        statBytes = bytes
+    }
+
+    /// La un video nou statisticile pornesc de la zero.
+    private func resetStats() {
+        statAt = 0; statBytes = -1; statShown = -1
+        diag.kbps = 0; diag.fps = 0; diag.dropped = 0; diag.frames = 0; diag.buffer = 0
+        diag.connection = ""; diag.videoSize = "—"
+        netError = ""
+        stallSince = 0
     }
 
     // MARK: - Diagnostic

@@ -65,6 +65,49 @@ def player(name, cid, ver, ua, extra):
                 if len(out) == 3:
                     print(f"{'':28}   itag {f['itag']:>3} bytes=0- -> HTTP {out[0]}, {int(out[1])//1024} KB în 8 s, "
                           f"{float(out[2])*8/1e6:.1f} Mbit/s")
+    if direct and "--deep" in sys.argv:
+        # Merge și mai departe în fișier, nu doar la început? (bucăți de 1 MB, ca un player)
+        for f in direct:
+            if f.get("itag") not in (299, 137, 140): continue
+            total = int(f.get("contentLength", "0") or 0)
+            res = []
+            for frac in (0, 0.05, 0.15, 0.3, 0.5, 0.8, 0.98):
+                a = int(total * frac); b = min(a + (1 << 20) - 1, total - 1)
+                c4, b4 = get(f["url"], {"User-Agent": ua, "Range": f"bytes={a}-{b}"})
+                res.append(f"{int(frac*100)}%:{c4}")
+            seq_ok = 0
+            for i in range(30):   # 30 MB la rând, ca la redare
+                a = i << 20
+                if a >= total: break
+                c5, _ = get(f["url"], {"User-Agent": ua, "Range": f"bytes={a}-{a + (1 << 20) - 1}"})
+                if c5 != 206: break
+                seq_ok += 1
+            print(f"{'':28}   itag {f['itag']:>3} ({total >> 20} MB): {'  '.join(res)}  · la rând: {seq_ok} MB OK"
+                  + ("" if seq_ok >= min(30, total >> 20) else f" (apoi HTTP {c5})"))
+    if direct and "--time" in sys.argv and name == "IOS":
+        # Limita e după poziție (secunde de conținut) sau crește cu timpul?
+        import time
+        f = next((x for x in direct if x.get("itag") == 299), None) or next((x for x in direct if x.get("itag") == 137), None)
+        if f:
+            total = int(f.get("contentLength", "0")); dur = int(f.get("approxDurationMs", "1")) / 1000
+            bps = total / dur
+            def at(sec, url=f["url"]):
+                a = int(sec * bps); c, _ = get(url, {"User-Agent": ua, "Range": f"bytes={a}-{a + (512 << 10) - 1}"}); return c
+            print(f"{'':28}   itag {f['itag']}: {dur:.0f} s, {bps*8/1e6:.1f} Mbit/s")
+            print(f"{'':28}   A) prima cerere direct la 120 s: HTTP {at(120)}")
+            # adrese noi pentru B
+            body = json.dumps({"context": {"client": {"clientName": name, "clientVersion": ver, "hl": "ro", "gl": "RO", **extra}},
+                               "videoId": VID, "contentCheckOk": True, "racyCheckOk": True}).encode()
+            h = {"Content-Type": "application/json", "User-Agent": ua, "X-YouTube-Client-Name": str(cid), "X-YouTube-Client-Version": ver}
+            _, b2 = get("https://www.youtube.com/youtubei/v1/player?prettyPrint=false", h, body)
+            o2 = json.loads(b2); fs = o2["streamingData"]["adaptiveFormats"]
+            u2 = next(x["url"] for x in fs if x.get("itag") == f["itag"])
+            t0 = time.time()
+            print(f"{'':28}   B) adrese noi: 0 s:{at(0, u2)}  50 s:{at(50, u2)}  90 s:{at(90, u2)}  150 s:{at(150, u2)}")
+            for wait in (30, 30):
+                time.sleep(wait)
+                el = time.time() - t0
+                print(f"{'':28}      după {el:.0f} s: 90 s:{at(90, u2)}  150 s:{at(150, u2)}  {int(60+el)} s:{at(60+el, u2)}")
     if sd.get("hlsManifestUrl"):
         c2, m = get(sd["hlsManifestUrl"], {"User-Agent": ua})
         res = sorted({l.split("RESOLUTION=")[1].split(",")[0] for l in m.decode(errors="ignore").splitlines() if "RESOLUTION=" in l},
