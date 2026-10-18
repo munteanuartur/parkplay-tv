@@ -8,7 +8,7 @@
 # Autor: arturm
 set -euo pipefail
 
-LABEL="com.parkplaytv.reinstall"
+LABEL="com.artur.parkplaytv.reinstall"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 SCRIPT="$(cd "$(dirname "$0")" && pwd)/reinstall-appletv.sh"
 LOG="$HOME/Library/Logs/ParkPlayTV-reinstall.log"

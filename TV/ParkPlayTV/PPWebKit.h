@@ -32,6 +32,9 @@ NS_ASSUME_NONNULL_BEGIN
 /// Reguli de blocare (format WebKit content blocker). ok = NO dacă tvOS nu le acceptă.
 - (void)addContentRules:(NSString *)json identifier:(NSString *)identifier completion:(void (^)(BOOL ok, NSString * _Nullable error))completion;
 - (void)setCookies:(NSArray<NSHTTPCookie *> *)cookies completion:(void (^)(void))completion;
+/// Toate cookie-urile din WebKit (pentru deconectarea contului YouTube).
+- (void)getCookies:(void (^)(NSArray<NSHTTPCookie *> *cookies))completion;
+- (void)deleteCookies:(NSArray<NSHTTPCookie *> *)cookies completion:(void (^)(void))completion NS_SWIFT_NAME(deleteCookies(_:completion:));
 - (void)loadURL:(NSURL *)url;
 - (void)reload;
 - (void)evaluate:(NSString *)js completion:(nullable void (^)(id _Nullable result, NSError * _Nullable error))completion;

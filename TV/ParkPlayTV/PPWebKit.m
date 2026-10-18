@@ -16,6 +16,8 @@
 - (void)addScriptMessageHandler:(id)scriptMessageHandler name:(NSString *)name;
 - (void)addContentRuleList:(id)contentRuleList;
 - (void)setCookie:(NSHTTPCookie *)cookie completionHandler:(void (^)(void))completionHandler;
+- (void)getAllCookies:(void (^)(NSArray<NSHTTPCookie *> *))completionHandler;
+- (void)deleteCookie:(NSHTTPCookie *)cookie completionHandler:(void (^)(void))completionHandler;
 - (void)compileContentRuleListForIdentifier:(NSString *)identifier encodedContentRuleList:(NSString *)encodedContentRuleList completionHandler:(void (^)(id, NSError *))completionHandler;
 + (instancetype)defaultStore;
 + (instancetype)storeWithURL:(NSURL *)url;
@@ -149,13 +151,37 @@ static void PPSet(id obj, id value, NSString *key) {
     }];
 }
 
-- (void)setCookies:(NSArray<NSHTTPCookie *> *)cookies completion:(void (^)(void))completion {
+- (id)cookieStore {
     id store = nil;
     @try {
         id config = [_view valueForKey:@"configuration"];
         id dataStore = [config valueForKey:@"websiteDataStore"];
         store = [dataStore valueForKey:@"httpCookieStore"];
     } @catch (__unused NSException *e) {}
+    return store;
+}
+
+- (void)getCookies:(void (^)(NSArray<NSHTTPCookie *> *))completion {
+    id store = [self cookieStore];
+    if (!store) { completion(@[]); return; }
+    [store getAllCookies:^(NSArray<NSHTTPCookie *> *all) {
+        dispatch_async(dispatch_get_main_queue(), ^{ completion(all ?: @[]); });
+    }];
+}
+
+- (void)deleteCookies:(NSArray<NSHTTPCookie *> *)cookies completion:(void (^)(void))completion {
+    id store = [self cookieStore];
+    if (!store || cookies.count == 0) { completion(); return; }
+    dispatch_group_t g = dispatch_group_create();
+    for (NSHTTPCookie *c in cookies) {
+        dispatch_group_enter(g);
+        [store deleteCookie:c completionHandler:^{ dispatch_group_leave(g); }];
+    }
+    dispatch_group_notify(g, dispatch_get_main_queue(), completion);
+}
+
+- (void)setCookies:(NSArray<NSHTTPCookie *> *)cookies completion:(void (^)(void))completion {
+    id store = [self cookieStore];
     if (!store || cookies.count == 0) { completion(); return; }
     dispatch_group_t g = dispatch_group_create();
     for (NSHTTPCookie *c in cookies) {

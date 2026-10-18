@@ -118,7 +118,10 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
 
     private override init() {
         let d = UserDefaults.standard
-        quality = d.string(forKey: "quality") ?? "hd1080"
+        // Fără plafon: cerem cea mai bună calitate oferită (scriptul coboară singur la ce există).
+        // Vechea valoare implicită „hd1080” e trecută automat pe 4K.
+        let savedQ = d.string(forKey: "quality") ?? "hd2160"
+        quality = savedQ == "hd1080" ? "hd2160" : savedQ
         rate = d.object(forKey: "rate") as? Double ?? 1.0
         siteMode = SiteMode(rawValue: d.string(forKey: "site") ?? "") ?? .mobile // pe Apple TV doar mobilul merge (fără MSE)
         sponsorBlock = d.object(forKey: "sponsorblock") as? Bool ?? true
@@ -361,9 +364,62 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
                             self.siteMode = .mobile   // reîncarcă video-ul curent pe m.youtube
                         } else {
                             self.diag.lastEvent = "YouTube (mobil): " + (err.isEmpty ? "video-ul nu pornește" : err)
+                            let e = err.lowercased()
+                            if e.contains("bot") || e.contains("sign in") || e.contains("conecteaz") || e.contains("login") {
+                                TVAppState.shared.toast(self.signedIn
+                                    ? "YouTube cere din nou login: trimite cookie-uri noi din Setări → Sincronizare"
+                                    : "YouTube cere login: conectează contul din Setări → Sincronizare")
+                            }
                         }
                     }
                 }
+            }
+        }
+    }
+
+    // MARK: - Cont YouTube (cookie-uri trimise de pe telefon / Mac prin pagina de sincronizare)
+
+    /// YouTube cere uneori pe Apple TV „Sign in to confirm you're not a bot” (LOGIN_REQUIRED).
+    /// Cu cookie-urile unui cont logat, pagina m.youtube redă normal. WebKit le ține singur
+    /// (magazinul de date e persistent) și le reînnoiește; nu le mai rescriem la pornire.
+    @Published private(set) var signedIn = UserDefaults.standard.bool(forKey: "yt_signed_in")
+
+    private static let authNames: Set<String> = [
+        "SID", "HSID", "SSID", "APISID", "SAPISID", "LOGIN_INFO",
+        "__Secure-1PSID", "__Secure-3PSID", "__Secure-1PAPISID", "__Secure-3PAPISID",
+    ]
+
+    func signIn(with cookies: [HTTPCookie]) async -> String {
+        guard let w = web else { return "WebKit nu e disponibil pe acest Apple TV" }
+        guard cookies.contains(where: { Self.authNames.contains($0.name) }) else {
+            return cookies.isEmpty
+                ? "Nu am găsit cookie-uri YouTube în textul lipit"
+                : "Lipsesc cookie-urile de login (SID, SAPISID…). Ești logat pe youtube.com în browserul din care le-ai exportat?"
+        }
+        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in w.setCookies(cookies) { c.resume() } }
+        signedIn = true
+        UserDefaults.standard.set(true, forKey: "yt_signed_in")
+        diag.lastEvent = "cont YouTube conectat (\(cookies.count) cookie-uri)"
+        if loaded && index >= 0 { playIndex(index, start: clock.position) }
+        return "Conectat: am pus \(cookies.count) cookie-uri YouTube pe Apple TV"
+    }
+
+    func signOut() {
+        signedIn = false
+        UserDefaults.standard.set(false, forKey: "yt_signed_in")
+        web?.getCookies { all in
+            let mine = all.filter {
+                ($0.domain.hasSuffix("youtube.com") || $0.domain.hasSuffix("google.com")) && $0.name != "SOCS" && $0.name != "CONSENT"
+            }
+            Task { @MainActor in self.removeCookies(mine) }
+        }
+    }
+
+    private func removeCookies(_ mine: [HTTPCookie]) {
+        web?.deleteCookies(mine) {
+            Task { @MainActor in
+                self.diag.lastEvent = "cont YouTube deconectat"
+                if self.loaded && self.index >= 0 { self.playIndex(self.index, start: self.clock.position) }
             }
         }
     }

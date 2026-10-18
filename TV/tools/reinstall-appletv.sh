@@ -5,7 +5,6 @@
 #   bash reinstall-appletv.sh            → reinstalează dacă au trecut 6 zile de la ultima instalare
 #   bash reinstall-appletv.sh --force    → reinstalează acum
 #
-# Semnare: TV/tools/local.conf cu TEAM_ID="…" și BUNDLE_ID="…" (vezi README).
 # Opțional:  PARKPLAY_DEVICE="appleTV"  (numele / UDID-ul Apple TV-ului; implicit primul Apple TV găsit)
 #            PARKPLAY_DAYS=6
 # Jurnal:    ~/Library/Logs/ParkPlayTV-reinstall.log
@@ -20,12 +19,6 @@ DAYS="${PARKPLAY_DAYS:-6}"
 DEVICE="${PARKPLAY_DEVICE:-}"
 FORCE=0
 [ "${1:-}" = "--force" ] && FORCE=1
-
-TEAM_ID=""; BUNDLE_ID=""
-[ -f "$(dirname "$0")/local.conf" ] && . "$(dirname "$0")/local.conf"
-EXTRA=()
-[ -n "$TEAM_ID" ] && EXTRA+=("DEVELOPMENT_TEAM=$TEAM_ID")
-[ -n "$BUNDLE_ID" ] && EXTRA+=("PRODUCT_BUNDLE_IDENTIFIER=$BUNDLE_ID")
 
 mkdir -p "$STATE_DIR" "$(dirname "$LOG")"
 exec > >(tee -a "$LOG") 2>&1
@@ -94,7 +87,7 @@ DERIVED="$TV_DIR/build/DerivedData"
 echo "Compilez…"
 xcodebuild "${SRC[@]}" -scheme ParkPlayTV -configuration Release \
   -destination 'generic/platform=tvOS' -derivedDataPath "$DERIVED" \
-  -allowProvisioningUpdates -allowProvisioningDeviceRegistration ${EXTRA[@]+"${EXTRA[@]}"} build -quiet || fail "compilarea a eșuat (vezi jurnalul)"
+  -allowProvisioningUpdates build -quiet || fail "compilarea a eșuat (vezi jurnalul)"
 
 APP="$DERIVED/Build/Products/Release-appletvos/ParkPlayTV.app"
 [ -d "$APP" ] || fail "nu găsesc aplicația compilată"

@@ -13,11 +13,26 @@ Redarea folosește pagina m.youtube într-un WKWebView încărcat prin **API pri
 
 ## Instalare
 
-1. În folderul `TV`: `pod install` (o singură dată; CocoaPods: `brew install cocoapods`), apoi deschide `ParkPlayTV.xcworkspace` (nu `.xcodeproj`).
-2. Target **ParkPlayTV** → **Signing & Capabilities** → alege Team-ul și pune un **Bundle Identifier** al tău (ex. `com.numeletau.parkplay.tv`). Pentru scripturi, scrie aceleași valori în `TV/tools/local.conf`: `TEAM_ID="…"` și `BUNDLE_ID="…"`.
+1. Deschide `TV/ParkPlayTV.xcodeproj`. Dacă ai instalat VLC pentru testul 4K (vezi mai jos), deschide în schimb `ParkPlayTV.xcworkspace`.
+2. Target **ParkPlayTV** → **Signing & Capabilities** → alege Team-ul.
 3. Alege Apple TV-ul ca destinație → **Run (⌘R)**.
 
 Cu un Apple ID gratuit, aplicația expiră după 7 zile și trebuie reinstalată din Xcode. Cu contul de dezvoltator (99 $/an), ține un an.
+
+## Cont YouTube („Sign in to confirm you're not a bot”)
+
+Uneori YouTube refuză redarea pe Apple TV și cere login (LOGIN_REQUIRED): video-ul rămâne negru, cu spinner, iar în Diagnostic → „Ultimul eveniment” apare eroarea. Pe Mac merge în aceeași rețea, deci blocajul e doar pe TV. Soluția: trimiți pe TV cookie-urile unui cont YouTube logat.
+
+1. Chrome → instalează extensia **Get cookies.txt LOCALLY** → `chrome://extensions` → Details → activează **Allow in Incognito**.
+2. Deschide o fereastră **Incognito** (⇧⌘N), intră pe **youtube.com** și loghează-te (de preferat cu un cont secundar).
+3. Pe pagina YouTube: iconița extensiei → format **Netscape** → **Copy**.
+4. Pe TV: Setări → pornește **Pagina de sincronizare**. Pe Mac, într-o fereastră normală, deschide adresa afișată (`http://IP:8080`).
+5. Lipește textul în „Cont YouTube” → **🔑 Conectează pe Apple TV**. Video-ul curent se reîncarcă singur.
+6. Închide fereastra Incognito **fără** „Deconectare” din YouTube (altfel Google invalidează și sesiunea de pe TV).
+
+Fără extensie: în fereastra Incognito logată, ⌥⌘I → **Network** → ⌘R → click pe prima cerere (`www.youtube.com`) → Request Headers → copiază valoarea **cookie:** și lipește-o la pasul 5. Se acceptă și JSON exportat din **Cookie-Editor**.
+
+Starea se vede în Setări → Cont YouTube (conectat / neconectat); tot acolo e butonul de deconectare. WebKit păstrează sesiunea între reporniri. Dacă YouTube cere iar login, aplicația afișează un mesaj: repeți pașii 2–5 cu cookie-uri noi.
 
 ## Test 4K cu VLC (opțional)
 

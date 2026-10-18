@@ -16,7 +16,7 @@ struct TVSettingsView: View {
                     }
                     Toggle("Autoplay: continuă cu video-uri asemănătoare", isOn: $engine.autoplay)
                     Toggle("SponsorBlock: sari peste intro, reclame citite", isOn: $engine.sponsorBlock)
-                    Text("Calitatea e automată: YouTube trimite video-ul ca HLS, iar Apple TV alege singur calitatea (până la 1080p) după viteza rețelei.")
+                    Text("Calitatea: aplicația cere cea mai bună variantă oferită de YouTube (până la 4K). Pe site-ul mobil (HLS) YouTube dă de obicei cel mult 1080p; vezi „Calități oferite” în Diagnostic.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
 
@@ -31,6 +31,19 @@ struct TVSettingsView: View {
                             .font(.caption).foregroundStyle(.secondary)
                     }
                     if !sync.lastAction.isEmpty { Text(sync.lastAction).foregroundStyle(.pink) }
+                }
+
+                Section("Cont YouTube") {
+                    HStack {
+                        Text("Stare")
+                        Spacer()
+                        Text(engine.signedIn ? "conectat" : "neconectat").foregroundStyle(engine.signedIn ? Color.green : Color.secondary)
+                    }
+                    Text("Dacă YouTube cere „Sign in to confirm you're not a bot”, pornește pagina de sincronizare și lipește acolo cookie-urile YouTube din browserul în care ești logat.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    if engine.signedIn {
+                        Button("Deconectează contul de pe Apple TV", role: .destructive) { engine.signOut() }
+                    }
                 }
 
                 Section("Avansat") {

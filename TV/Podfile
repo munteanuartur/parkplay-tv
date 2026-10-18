@@ -14,7 +14,6 @@ post_install do |installer|
     t.build_configurations.each do |c|
       c.build_settings['TVOS_DEPLOYMENT_TARGET'] = '17.0'
       c.build_settings['ENABLE_USER_SCRIPT_SANDBOXING'] = 'NO'
-      c.build_settings['ENABLE_MODULE_VERIFIER'] = 'NO'
     end
   end
   installer.pods_project.build_configurations.each do |c|
