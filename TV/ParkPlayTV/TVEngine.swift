@@ -252,7 +252,15 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
                     self.mseStats(r)
                     self.checkMSEFallback(r)
                     let clock = String(format: "window.__ppClock&&window.__ppClock(%.3f,%@);", r.currentTime, r.isPlaying ? "true" : "false")
-                    self.web?.evaluate(clock + "window.__ppTick&&window.__ppTick()", completion: nil)
+                    // Subtitrările le desenează player-ul YouTube în pagină (sub imaginea nativă): le luăm ca text.
+                    let cc = "(function(){var c=document.querySelector('.ytp-caption-window-container .caption-window, .ytp-caption-window-container, .caption-window');return c?(c.innerText||c.textContent||''):''})()"
+                    self.web?.evaluate(clock + "window.__ppTick&&window.__ppTick();" + cc) { res, _ in
+                        Task { @MainActor in
+                            let text = ((res as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                            if self.captionChoice == "off" { if !self.captionText.isEmpty { self.captionText = "" } }
+                            else if text != self.captionText { self.captionText = text }
+                        }
+                    }
                 }
             }
         }
@@ -297,6 +305,11 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
     private func stateJs() -> String {
         "window.__ppRate=\(rate);window.__ppQ='\(webQualityOverride ?? quality)';window.__ppWant=\(wantPlay);window.__ppStats=true;"
     }
+
+    /// Textul subtitrării curente (calea 1080p: imaginea e nativă, deci subtitrarea o afișăm noi peste ea).
+    @Published private(set) var captionText = ""
+    /// Ce site (mobil / desktop…) e încărcat acum în pagină.
+    private var pageSiteMode: SiteMode?
 
     /// Calitatea aleasă din player pentru video-ul curent (pe pagina YouTube); următorul pornește după setare.
     @Published private(set) var webQualityOverride: String?
@@ -347,6 +360,8 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
         loadToken += 1
         let token = loadToken
         webQualityOverride = nil
+        let wasFallback = mseFallback
+        captionText = ""
         mseFallback = false
         mseStatAt = 0
         if playerMode == .native {
@@ -373,7 +388,12 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
             }
         } else {
             stopNative()
-            loadWeb(u)
+            // Video următor în aceeași pagină (fără reîncărcare) — mult mai rapid. Altfel: pagină nouă.
+            if FakeMSE.enabled && !wasFallback && webHasContent && ready && !suspended && pageSiteMode == siteMode {
+                switchInPage(t.id, start: start, fallback: u, token: token)
+            } else {
+                loadWeb(u)
+            }
         }
         saveSession()
         if sponsorBlock {
@@ -690,7 +710,41 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
         nativeLoader = nil
     }
 
+    /// Schimbă video-ul în pagina deja deschisă (player-ul YouTube: loadVideoById). Dacă nu merge sau
+    /// nu pornește în 8 s, reîncarcă pagina ca înainte.
+    private func switchInPage(_ id: String, start: Double, fallback u: URL, token: Int) {
+        MSERenderer.shared.reset()
+        let code = "(function(){try{var mp=document.getElementById('movie_player');if(!mp||!mp.loadVideoById)return 'nu';" +
+            "window.__ppMSEReset&&window.__ppMSEReset();mp.loadVideoById({videoId:'\(id)',startSeconds:\(Int(start))});return 'ok';}catch(e){return 'eroare: '+e;}})()"
+        web?.evaluate(code) { [weak self] r, _ in
+            Task { @MainActor in
+                guard let self, token == self.loadToken else { return }
+                guard (r as? String) == "ok" else {
+                    self.diag.lastEvent = "schimbare rapidă indisponibilă → reîncarc pagina"
+                    self.loadWeb(u)
+                    return
+                }
+                self.diag.lastEvent = "video schimbat în aceeași pagină"
+                self.applyState()
+                self.loadPageInfo(attempt: 0)
+                try? await Task.sleep(nanoseconds: 8_000_000_000)
+                guard token == self.loadToken else { return }
+                let check = "(function(){try{var d=document.getElementById('movie_player').getVideoData();return (d&&d.video_id)||''}catch(e){return ''}})()"
+                self.web?.evaluate(check) { r2, _ in
+                    Task { @MainActor in
+                        guard token == self.loadToken else { return }
+                        if (r2 as? String) != id || (MSERenderer.shared.bytesIn == 0 && !self.playing) {
+                            self.diag.lastEvent = "schimbarea rapidă n-a pornit → reîncarc pagina"
+                            self.loadWeb(u)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     private func loadWeb(_ u: URL) {
+        pageSiteMode = siteMode
         webHasContent = true
         if ready { web?.load(u) } else { pendingURL = u }
     }
@@ -1144,7 +1198,14 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
         case "mse-reset": MSERenderer.shared.reset(); return
         case "mse-play": MSERenderer.shared.play(); return
         case "mse-pause": MSERenderer.shared.pause(); return
-        case "mse-seek": MSERenderer.shared.seek(d("time")); return
+        case "mse-seek":
+            if !MSERenderer.shared.seek(d("time"), keep: b("keep")) {
+                js("window.__ppDropRanges&&window.__ppDropRanges()")   // nu era în memorie: pagina retrimite
+            }
+            return
+        case "mse-rm":
+            MSERenderer.shared.remove(kind: m["k"] as? String ?? "v", from: d("a"), to: d("b"))
+            return
         default: break
         }
         if nativeActive && m["t"] as? String != "stats" { return } // pagina veche nu mai comandă

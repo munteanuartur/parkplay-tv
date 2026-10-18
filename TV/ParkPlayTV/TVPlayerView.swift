@@ -100,15 +100,20 @@ struct TVPlayerView: View {
                 if FakeMSE.enabled && !engine.mseFallback { MSEHost().ignoresSafeArea() }
             }
 
+            // Subtitrările pe calea 1080p (imaginea e nativă, așa că le desenăm noi, cu textul din pagina YouTube).
+            if FakeMSE.enabled && !engine.nativeActive && !engine.mseFallback && engine.captionChoice != "off" && !engine.captionText.isEmpty {
+                Text(engine.captionText)
+                    .font(.system(size: 40 * engine.captionSize, weight: .semibold))
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 20).padding(.vertical, 8)
+                    .background(.black.opacity(0.7), in: RoundedRectangle(cornerRadius: 10))
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                    .padding(.horizontal, 120)
+                    .padding(.bottom, osd ? 300 : 70)
+                    .allowsHitTesting(false)
+            }
             if engine.wantPlay && (engine.buffering || engine.extending) && !engine.playing {
                 ProgressView().scaleEffect(1.6)
-            }
-            if engine.inAd {
-                Text("Reclamă blocată — se sare…")
-                    .padding(.horizontal, 20).padding(.vertical, 10)
-                    .background(.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 10))
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
-                    .padding(60)
             }
             if let flash {
                 Text(flash).font(.title.bold())

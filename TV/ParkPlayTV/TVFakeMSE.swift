@@ -162,6 +162,8 @@ enum FakeMSE {
       SB.prototype.remove = function(a, b){
         var self = this; self.updating = true;
         self.r = cutRange(self.r, a, b);
+        // Aplicația păstrează aceleași date ca pagina (pentru derularea rapidă): ce scoate pagina, scoate și ea.
+        toApp({t: 'mse-rm', k: /^video/.test(self.info.type) ? 'v' : 'a', a: a, b: (b === Infinity ? 1e9 : b)});
         later(function(){ self.updating = false; self.dispatchEvent({type: 'update'}); self.dispatchEvent({type: 'updateend'}); });
       };
       SB.prototype.abort = function(){};
@@ -316,6 +318,19 @@ enum FakeMSE {
       }
       window.__ppTick = tick;
       // Ceasul real vine de la redarea nativă (aplicația îl trimite de 4 ori pe secundă).
+      // Aplicația n-a mai avut datele în memorie: player-ul trebuie să le trimită din nou.
+      window.__ppDropRanges = function(){
+        fakes.forEach(function(el){ if (el.__ppMS) el.__ppMS.sourceBuffers.forEach(function(sb){ sb.r = []; }); mediaTick(el); });
+      };
+      // Video nou în aceeași pagină (loadVideoById): pornim de la zero starea <video>-ului simulat.
+      window.__ppMSEReset = function(){
+        window.__ppNT = undefined;
+        fakes.forEach(function(el){
+          var st = el.__ppS; if (!st) return;
+          st.t = 0; st.ended = false; st.playing = false; st.waiting = false; st.seeking = false;
+          if (el.__ppMS) el.__ppMS.sourceBuffers.forEach(function(sb){ sb.r = []; });
+        });
+      };
       window.__ppClock = function(t, playing){
         window.__ppNT = t;
         fakes.forEach(function(el){
@@ -338,10 +353,15 @@ enum FakeMSE {
       }
       prop('currentTime', function(st){ return st.t; }, function(st, v){
         var el = this; st.t = Math.max(0, Number(v) || 0); st.ended = false; st.seeking = true; st.playing = false;
-        // Aplicația golește ce avea în redare: player-ul trebuie să trimită din nou datele de la noua poziție.
-        if (el.__ppMS) el.__ppMS.sourceBuffers.forEach(function(sb){ sb.r = []; });
+        // Dacă noua poziție e deja în buffer (în pagină și în aplicație), aplicația o redă din memorie;
+        // altfel golim buffer-ul și player-ul trimite din nou datele de la noua poziție.
+        var ms = el.__ppMS;
+        var keep = !!ms && ms.sourceBuffers.length > 0 && ms.sourceBuffers.every(function(sb){
+          return sb.r.some(function(r){ return r[0] <= st.t + 0.05 && r[1] >= st.t + 1; });
+        });
+        if (!keep && ms) ms.sourceBuffers.forEach(function(sb){ sb.r = []; });
         window.__ppNT = st.t;
-        toApp({t: 'mse-seek', time: st.t});
+        toApp({t: 'mse-seek', time: st.t, keep: keep});
         S.dbg.sets++; S.dbg.lastSet = String(v) + ' @' + Math.round(performance.now() / 1000) + 's';
         fire(el, 'seeking');
         later(function(){ st.seeking = false; fire(el, 'seeked'); fire(el, 'timeupdate'); mediaTick(el); });

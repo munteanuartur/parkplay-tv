@@ -36,8 +36,12 @@ final class MSERenderer {
         var defaultFlags: UInt32 = 0
         var pending: [UInt8] = []
         var queue: [CMSampleBuffer] = []
+        /// Tot ce a trimis pagina și n-a scos încă (pentru derularea instantanee în porțiunea încărcată).
+        var cache: [(pts: Double, end: Double, key: Bool, size: Int, sb: CMSampleBuffer)] = []
+        var cacheBytes = 0
         var lastEnd: Double = 0
         var frames = 0
+        var frameDur: Double = 0
         var width = 0
         var height = 0
     }
@@ -90,15 +94,55 @@ final class MSERenderer {
         sync.rate = 0
     }
 
-    func seek(_ t: Double) {
+    /// Derulare. `keep` = pagina crede că poziția e deja în buffer: o redăm din memorie, fără descărcare.
+    /// Întoarce false dacă n-o avem în memorie (atunci pagina trebuie să trimită din nou datele).
+    @discardableResult
+    func seek(_ t: Double, keep: Bool = false) -> Bool {
         displayLayer.flush()
         audioRenderer.flush()
-        for tr in [video, audio] {
-            tr.queue.removeAll()
-            tr.lastEnd = t
-        }
         sync.setRate(0, time: CMTime(seconds: max(t, 0), preferredTimescale: 90_000))
         waiting = true
+        if keep,
+           let vi = video.cache.lastIndex(where: { $0.key && $0.pts <= t + 0.001 }),
+           (video.cache.last?.end ?? 0) >= t + 0.5,
+           audio.format == nil || audio.cache.contains(where: { $0.pts <= t + 0.1 && $0.end > t }) {
+            video.queue = video.cache[vi...].map { e in e.pts < t - 0.001 ? Self.hidden(e.sb) : e.sb }
+            if let ai = audio.cache.firstIndex(where: { $0.end > t }) {
+                audio.queue = audio.cache[ai...].map { $0.sb }
+            } else {
+                audio.queue = []
+            }
+            video.lastEnd = video.cache.last?.end ?? t
+            audio.lastEnd = audio.cache.last?.end ?? t
+            pump()
+            return true
+        }
+        for tr in [video, audio] {
+            tr.queue.removeAll()
+            tr.cache.removeAll()
+            tr.cacheBytes = 0
+            tr.lastEnd = t
+        }
+        return !keep
+    }
+
+    /// Pagina a scos o porțiune din buffer: o scoatem și din memorie.
+    func remove(kind: String, from a: Double, to b: Double) {
+        let tr = kind == "v" ? video : audio
+        tr.cache.removeAll { $0.pts >= a && $0.pts < b }
+        tr.cacheBytes = tr.cache.reduce(0) { $0 + $1.size }
+    }
+
+    /// Cadrele dinaintea poziției de derulare se decodează (de la cadrul cheie), dar nu se afișează.
+    private static func hidden(_ sb: CMSampleBuffer) -> CMSampleBuffer {
+        var copy: CMSampleBuffer?
+        guard CMSampleBufferCreateCopy(allocator: kCFAllocatorDefault, sampleBuffer: sb, sampleBufferOut: &copy) == noErr,
+              let copy, let atts = CMSampleBufferGetSampleAttachmentsArray(copy, createIfNecessary: true),
+              CFArrayGetCount(atts) > 0 else { return sb }
+        let dict = unsafeBitCast(CFArrayGetValueAtIndex(atts, 0), to: CFMutableDictionary.self)
+        CFDictionarySetValue(dict, Unmanaged.passUnretained(kCMSampleAttachmentKey_DoNotDisplay).toOpaque(),
+                             Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
+        return copy
     }
 
     /// Bucată nouă de la pagină. `kind` = "v" / "a"; `offset` = timestampOffset al SourceBuffer-ului.
@@ -125,9 +169,10 @@ final class MSERenderer {
             sync.rate = 1
             waiting = false
         }
-        info = String(format: "%@ · %.1f s · buffer %.1f s · cadre %d · %dx%d",
+        info = String(format: "%@ · %.1f s · buffer %.1f s · cadre %d · %dx%d @%.0f fps · memorie %d MB",
                       sync.rate > 0 ? "rulează" : (wantPlay ? "așteaptă date" : "pauză"),
-                      t, max(ahead, 0), video.frames, video.width, video.height)
+                      t, max(ahead, 0), video.frames, video.width, video.height,
+                      video.frameDur > 0 ? 1 / video.frameDur : 0, (video.cacheBytes + audio.cacheBytes) >> 20)
     }
 
     // MARK: - Trimiterea cadrelor la renderer-e
@@ -317,12 +362,23 @@ final class MSERenderer {
                     if let sbuf = makeSample(b, dataPos, sz, fmt: fmt,
                                              pts: dts + cto + off, dts: dts + off, dur: Int64(dur), ts: ts, nonSync: nonSync) {
                         tr.queue.append(sbuf)
-                        if isVideo { tr.frames += 1 }
+                        let p0 = Double(dts + cto + off) / Double(ts)
+                        tr.cache.append((pts: p0, end: p0 + Double(dur) / Double(ts), key: !nonSync, size: sz, sb: sbuf))
+                        tr.cacheBytes += sz
+                        if isVideo { tr.frames += 1; if dur > 0 { tr.frameDur = Double(dur) / Double(ts) } }
                     }
                     dts += Int64(dur)
                     dataPos += sz
                 }
                 tr.lastEnd = max(tr.lastEnd, Double(dts + off) / Double(ts))
+                // Limita memoriei (~400 MB video): cel mai vechi iese primul.
+                let limit = isVideo ? 400 << 20 : 40 << 20
+                if tr.cacheBytes > limit {
+                    var drop = 0, freed = 0
+                    while drop < tr.cache.count && tr.cacheBytes - freed > limit * 3 / 4 { freed += tr.cache[drop].size; drop += 1 }
+                    tr.cache.removeFirst(drop)
+                    tr.cacheBytes -= freed
+                }
             }
         }
     }
