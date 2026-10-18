@@ -126,7 +126,8 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
 
     /// Calitățile de pornire (Setări → Redare).
     static let startQualities: [(String, String)] = [
-        ("hd1080", "1080p (AVPlayer, recomandat)"),
+        ("auto", "Auto — după viteza internetului (până la 1080p)"),
+        ("hd1080", "1080p"),
         ("hd720", "720p"),
         ("large", "480p"),
         ("vlc30", "4K / 1440p la 30 fps când există (VLC), altfel 1080p"),
@@ -249,6 +250,10 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
                     guard let self, !self.suspended, !self.nativeActive else { return }
                     let r = MSERenderer.shared
                     r.update()
+                    if r.needsFreshInit {
+                        r.needsFreshInit = false
+                        self.bounceQuality()
+                    }
                     if r.needsReload {
                         // Imaginea nu s-a putut reface pe loc: reîncărcăm video-ul (pagină nouă) de la aceeași secundă.
                         r.needsReload = false
@@ -322,6 +327,21 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
 
     /// Calitatea aleasă din player pentru video-ul curent (pe pagina YouTube); următorul pornește după setare.
     @Published private(set) var webQualityOverride: String?
+
+    /// Calitatea coboară o treaptă pentru 4 s, apoi revine: player-ul YouTube trimite astfel un antet
+    /// video nou (exact ce se întâmpla când schimbai tu calitatea și imaginea își revenea).
+    private func bounceQuality() {
+        let target = webQualityOverride ?? quality
+        diag.lastEvent = "imagine înghețată → schimbare scurtă de calitate"
+        js("(function(){try{var mp=document.getElementById('movie_player');var lv=(mp.getAvailableQualityLevels()||[]).filter(function(q){return q!=='auto';});" +
+           "var cur=mp.getPlaybackQuality();var i=lv.indexOf(cur);var alt=lv[i+1]||lv[i-1];if(alt){window.__ppQ=alt;window.__ppQSet='';}}catch(e){}})()")
+        let token = loadToken
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 4_000_000_000)
+            guard token == self.loadToken else { return }
+            self.js("window.__ppQ='\(target)';window.__ppQSet='';")
+        }
+    }
 
     func selectWebQuality(_ q: String) {
         webQualityOverride = q
@@ -398,7 +418,9 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
         } else {
             stopNative()
             // Video următor în aceeași pagină (fără reîncărcare) — mult mai rapid. Altfel: pagină nouă.
-            if FakeMSE.enabled && !wasFallback && webHasContent && ready && !suspended && pageSiteMode == siteMode {
+            // (După 10 schimbări la rând pagina se reîncarcă oricum: player-ul YouTube „obosește” în timp.)
+            if FakeMSE.enabled && !wasFallback && webHasContent && ready && !suspended && pageSiteMode == siteMode && inPageSwitches < 10 {
+                inPageSwitches += 1
                 switchInPage(t.id, start: start, fallback: u, token: token)
             } else {
                 loadWeb(u)
@@ -752,7 +774,10 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
         }
     }
 
+    private var inPageSwitches = 0
+
     private func loadWeb(_ u: URL) {
+        inPageSwitches = 0
         pageSiteMode = siteMode
         webHasContent = true
         if ready { web?.load(u) } else { pendingURL = u }

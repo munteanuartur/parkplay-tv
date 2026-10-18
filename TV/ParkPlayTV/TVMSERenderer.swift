@@ -79,6 +79,8 @@ final class MSERenderer {
         audioRenderer.flush()
         noFormatFragments = 0
         stuckSince = 0
+        sameShown = 0
+        lastShown = nil
         needsReload = false
         if keepFormats {
             video = Self.fresh(from: video)
@@ -182,6 +184,9 @@ final class MSERenderer {
 
     /// Aplicația trebuie să reîncarce video-ul curent (refacerea pe loc n-a ajutat).
     var needsReload = false
+    /// Aplicația trebuie să facă pagina să retrimită antetul video (schimbare scurtă de calitate).
+    var needsFreshInit = false
+    private var lastInitRequest: Double = 0
     private var stuckSince: Double = 0
     private var lastFrames = 0
     private var enqueuedVideo = 0
@@ -191,8 +196,39 @@ final class MSERenderer {
 
     private func clock() -> Double { ProcessInfo.processInfo.systemUptime }
 
+    private var lastShown: AnyObject?
+    private var sameShown = 0
+
+    /// Imaginea afișată nu s-a mai schimbat deși ceasul merge (sunetul cântă) → înghețată.
+    private func imageFrozen() -> Bool {
+        guard #available(tvOS 18.0, *), video.frameDur > 0 else { return false }
+        let pb = displayLayer.sampleBufferRenderer.displayedPixelBuffer()
+        let obj = pb.map { $0 as AnyObject }
+        if let obj {
+            if let last = lastShown, obj === last { sameShown += 1 } else { sameShown = 0 }
+        } else if video.frames > 0 {
+            sameShown += 1   // nimic afișat deși au venit cadre
+        }
+        lastShown = obj
+        return sameShown >= 12   // ~3 s la 4 verificări pe secundă
+    }
+
     private func checkVideoHealth() {
-        guard sync.rate > 0 else { stuckSince = 0; lastFrames = enqueuedVideo; return }
+        guard sync.rate > 0 else { stuckSince = 0; lastFrames = enqueuedVideo; sameShown = 0; return }
+        if imageFrozen() {
+            sameShown = 0
+            // Cauza obișnuită: video nou în aceeași pagină, cu alt antet H.264 decât cel păstrat, iar
+            // YouTube nu l-a retrimis. O schimbare scurtă de calitate îl face să trimită antetul nou.
+            let now = clock()
+            if now - lastInitRequest > 12 {
+                lastInitRequest = now
+                info = "imagine înghețată → cer antet nou (schimbare scurtă de calitate)"
+                needsFreshInit = true
+            } else {
+                recoverVideo("imagine înghețată")
+            }
+            return
+        }
         let failed = displayLayer.status == .failed || displayLayer.requiresFlushToResumeDecoding
         // Sunetul merge, dar la imagine nu mai ajunge nimic: coadă blocată sau cadre fără format.
         let starving = video.format == nil && noFormatFragments > 0
@@ -509,8 +545,8 @@ struct MSEHost: UIViewRepresentable {
         return v
     }
     func updateUIView(_ v: LayerView, context: Context) {
+        // Doar view-ul cel mai nou ține stratul (unul vechi, încă viu, nu are voie să-l „fure” înapoi).
         let layer = MSERenderer.shared.displayLayer
-        if layer.superlayer !== v.layer { layer.removeFromSuperlayer(); v.layer.addSublayer(layer) }
-        layer.frame = v.bounds
+        if layer.superlayer === v.layer { layer.frame = v.bounds }
     }
 }
