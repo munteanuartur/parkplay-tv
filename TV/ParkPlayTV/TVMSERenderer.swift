@@ -71,17 +71,36 @@ final class MSERenderer {
 
     // MARK: - Comenzi (din pagină: play / pause / seek / reset)
 
-    func reset() {
+    /// `keepFormats`: video nou în aceeași pagină — player-ul YouTube refolosește SourceBuffer-ele și
+    /// poate să NU mai trimită antetul (moov) dacă formatul e același. Păstrăm formatul, golim restul.
+    func reset(keepFormats: Bool = false) {
         sync.rate = 0
         displayLayer.flushAndRemoveImage()
         audioRenderer.flush()
-        video = Track()
-        audio = Track()
+        if keepFormats {
+            video = Self.fresh(from: video)
+            audio = Self.fresh(from: audio)
+        } else {
+            video = Track()
+            audio = Track()
+        }
         bytesIn = 0
         ahead = 0
         sync.setRate(0, time: .zero)
         waiting = true
         wantPlay = false
+    }
+
+    private static func fresh(from old: Track) -> Track {
+        let t = Track()
+        t.format = old.format
+        t.timescale = old.timescale
+        t.defaultDuration = old.defaultDuration
+        t.defaultSize = old.defaultSize
+        t.defaultFlags = old.defaultFlags
+        t.width = old.width
+        t.height = old.height
+        return t
     }
 
     func play() {

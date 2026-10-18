@@ -713,7 +713,7 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
     /// Schimbă video-ul în pagina deja deschisă (player-ul YouTube: loadVideoById). Dacă nu merge sau
     /// nu pornește în 8 s, reîncarcă pagina ca înainte.
     private func switchInPage(_ id: String, start: Double, fallback u: URL, token: Int) {
-        MSERenderer.shared.reset()
+        MSERenderer.shared.reset(keepFormats: true)
         let code = "(function(){try{var mp=document.getElementById('movie_player');if(!mp||!mp.loadVideoById)return 'nu';" +
             "window.__ppMSEReset&&window.__ppMSEReset();mp.loadVideoById({videoId:'\(id)',startSeconds:\(Int(start))});return 'ok';}catch(e){return 'eroare: '+e;}})()"
         web?.evaluate(code) { [weak self] r, _ in
