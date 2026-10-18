@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 /// Căutare YouTube fără API key, cu metode de rezervă:
 ///  1. pagina de rezultate (desktop)  → JSON-ul `ytInitialData`;
@@ -220,6 +221,56 @@ enum YouTubeSearch {
         }
     }
 
+    // MARK: - Pagina principală YouTube a contului (feed-ul „Acasă”)
+
+    private static let webClientVersion = "2.20250910.01.00"
+
+    /// Recomandările de pe youtube.com pentru contul logat (cookie-urile din WebKit).
+    /// Gol dacă nu ești logat sau dacă YouTube nu dă feed (ex. istoricul oprit în cont).
+    static func homeFeed(cookies: [HTTPCookie], limit: Int = 40) async -> [Track] {
+        var jar: [String: String] = [:]
+        for c in cookies where c.domain.hasSuffix("youtube.com") {
+            if jar[c.name] == nil || c.domain == ".youtube.com" { jar[c.name] = c.value }
+        }
+        guard !jar.isEmpty else { return [] }
+        let origin = "https://www.youtube.com"
+        let body: [String: Any] = [
+            "context": ["client": ["clientName": "WEB", "clientVersion": webClientVersion, "hl": "ro", "gl": "RO"]],
+            "browseId": "FEwhat_to_watch",
+        ]
+        var req = URLRequest(url: URL(string: origin + "/youtubei/v1/browse?prettyPrint=false")!)
+        req.httpMethod = "POST"
+        req.timeoutInterval = 15
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue(uaDesktop, forHTTPHeaderField: "User-Agent")
+        req.setValue(jar.map { "\($0.key)=\($0.value)" }.joined(separator: "; "), forHTTPHeaderField: "Cookie")
+        if let auth = sapisidAuth(jar, origin: origin) { req.setValue(auth, forHTTPHeaderField: "Authorization") }
+        req.setValue(origin, forHTTPHeaderField: "Origin")
+        req.setValue(origin, forHTTPHeaderField: "X-Origin")
+        req.setValue("0", forHTTPHeaderField: "X-Goog-AuthUser")
+        req.setValue("1", forHTTPHeaderField: "X-YouTube-Client-Name")
+        req.setValue(webClientVersion, forHTTPHeaderField: "X-YouTube-Client-Version")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        guard let res = try? await fetch(req), (res.1 as? HTTPURLResponse)?.statusCode == 200,
+              let data = JSON.parse(String(decoding: res.0, as: UTF8.self)) else { return [] }
+        var out = OrderedTracks(limit: limit)
+        collect(data, &out, renderers + ["lockupViewModel"])
+        return out.list
+    }
+
+    /// Antetul „Authorization” al site-ului: SHA-1 din „timp SAPISID origine”.
+    private static func sapisidAuth(_ jar: [String: String], origin: String) -> String? {
+        let ts = Int(Date().timeIntervalSince1970)
+        func h(_ v: String) -> String {
+            Insecure.SHA1.hash(data: Data("\(ts) \(v) \(origin)".utf8)).map { String(format: "%02x", $0) }.joined()
+        }
+        var parts: [String] = []
+        if let s = jar["SAPISID"] ?? jar["__Secure-3PAPISID"] { parts.append("SAPISIDHASH \(ts)_\(h(s))") }
+        if let s = jar["__Secure-1PAPISID"] { parts.append("SAPISID1PHASH \(ts)_\(h(s))") }
+        if let s = jar["__Secure-3PAPISID"] { parts.append("SAPISID3PHASH \(ts)_\(h(s))") }
+        return parts.isEmpty ? nil : parts.joined(separator: " ")
+    }
+
     /// Titlul și canalul unui video (pentru linkuri deschise în aplicație).
     static func oembed(_ id: String) async -> Track {
         let url = "https://www.youtube.com/oembed?format=json&url=" + enc("https://www.youtube.com/watch?v=\(id)")
@@ -324,7 +375,8 @@ enum YouTubeSearch {
         switch node {
         case .object(let kv):
             for k in keys {
-                if let r = node.obj(k), let t = toTrack(r) { out.add(t) }
+                guard let r = node.obj(k) else { continue }
+                if let t = k == "lockupViewModel" ? lockupTrack(r) : toTrack(r) { out.add(t) }
             }
             for (_, v) in kv { collect(v, &out, keys) }
         case .array(let a):
@@ -358,6 +410,45 @@ enum YouTubeSearch {
         let published = text(r.obj("publishedTimeText")) ?? ""
         let views = parseViews(text(r.obj("viewCountText")) ?? text(r.obj("shortViewCountText")))
         return Track(id: id, title: title, channel: channel, duration: duration, published: published, views: views)
+    }
+
+    /// Formatul nou al YouTube (`lockupViewModel`), folosit pe pagina principală.
+    private static func lockupTrack(_ r: JSON) -> Track? {
+        guard r.str("contentType") == "LOCKUP_CONTENT_TYPE_VIDEO" else { return nil } // fără playlisturi / mixuri
+        let id = r.str("contentId")
+        guard id.count == 11, let meta = r.obj("metadata")?.obj("lockupMetadataViewModel") else { return nil }
+        let title = meta.obj("title")?.str("content") ?? ""
+        guard !title.isEmpty else { return nil }
+        let rows = meta.obj("metadata")?.obj("contentMetadataViewModel")?["metadataRows"]?.array ?? []
+        let texts: [[String]] = rows.map { row in
+            (row["metadataParts"]?.array ?? []).compactMap { p in
+                let s = p.obj("text")?.str("content") ?? ""
+                return s.isEmpty ? nil : s
+            }
+        }
+        let channel = texts.first?.first ?? ""
+        let rest = texts.dropFirst().flatMap { $0 }
+        let viewsText = rest.first { matches("vizion|view|просм", $0.lowercased()) }
+        let published = rest.first { matches("acum|ago|назад|în urmă", $0.lowercased()) } ?? ""
+        return Track(id: id, title: title, channel: channel, duration: badge(r.obj("contentImage")) ?? "",
+                     published: published, views: parseViews(viewsText))
+    }
+
+    /// Durata de pe miniatură („12:34”), oriunde e în structura imaginii.
+    private static func badge(_ node: JSON?) -> String? {
+        guard let node else { return nil }
+        switch node {
+        case .object(let kv):
+            if let b = node.obj("thumbnailBadgeViewModel") {
+                let t = b.str("text")
+                if matches("^\\d+(:\\d\\d)+$", t) { return t }
+            }
+            for (_, v) in kv { if let t = badge(v) { return t } }
+        case .array(let a):
+            for v in a { if let t = badge(v) { return t } }
+        default: break
+        }
+        return nil
     }
 
     /// „1.234.567 de vizionări”, „1,2 mil. de vizionări”, „3.4M views” → număr; -1 dacă nu se poate.

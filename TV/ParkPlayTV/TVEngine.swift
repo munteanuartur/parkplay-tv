@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import AVFoundation
 
 /// Poziția și durata (se schimbă des — separat, ca să nu redesenăm tot).
 @MainActor
@@ -71,8 +72,40 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
     @Published private(set) var qualities: [String] = []
     @Published private(set) var currentQuality = ""
     @Published private(set) var extending = false
-    @Published var quality: String { didSet { UserDefaults.standard.set(quality, forKey: "quality"); applyState() } }
-    @Published var rate: Double { didSet { UserDefaults.standard.set(rate, forKey: "rate"); applyState() } }
+    @Published var quality: String {
+        didSet {
+            UserDefaults.standard.set(quality, forKey: "quality")
+            applyState()
+            if nativeActive && oldValue != quality { reloadNative() }
+        }
+    }
+    @Published var rate: Double {
+        didSet {
+            UserDefaults.standard.set(rate, forKey: "rate")
+            applyState()
+            if nativeActive && avPlayer.rate > 0 { avPlayer.rate = Float(rate) }
+        }
+    }
+
+    /// Cum se redă: nativ (AVPlayer, până la 1080p, decodare hardware) sau prin pagina YouTube.
+    enum PlayerMode: String, CaseIterable, Identifiable {
+        case native, web
+        var id: String { rawValue }
+        var title: String { self == .native ? "Nativ (AVPlayer, până la 1080p)" : "Pagina YouTube (WebView)" }
+    }
+    @Published var playerMode: PlayerMode {
+        didSet {
+            UserDefaults.standard.set(playerMode.rawValue, forKey: "player_mode")
+            if index >= 0 && loaded && oldValue != playerMode { playIndex(index, start: clock.position) }
+        }
+    }
+
+    /// Player-ul nativ și starea lui.
+    let avPlayer = AVPlayer()
+    @Published private(set) var nativeActive = false
+    private var nativeLoader: LocalHLS?
+    private var loadToken = 0
+    private var webHasContent = false
     @Published var siteMode: SiteMode {
         didSet {
             UserDefaults.standard.set(siteMode.rawValue, forKey: "site")
@@ -128,9 +161,11 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
         autoplay = d.object(forKey: "autoplay") as? Bool ?? true
         captionChoice = d.string(forKey: "captions") ?? "off"
         captionSize = d.object(forKey: "cc_size") as? Double ?? 1.0
+        playerMode = PlayerMode(rawValue: d.string(forKey: "player_mode") ?? "") ?? .native
         super.init()
         restoreSession()
         setupWebView()
+        setupNative()
     }
 
     private func now() -> TimeInterval { ProcessInfo.processInfo.systemUptime }
@@ -222,7 +257,24 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
         StatsStore.countPlay(t)
         lastStatTick = 0
         guard let u = URL(string: siteMode.url(t.id, start: Int(start))) else { return }
-        if ready { web?.load(u) } else { pendingURL = u }
+        loadToken += 1
+        let token = loadToken
+        if playerMode == .native {
+            stopWebPage()
+            // Video-ul vechi se oprește imediat (altfel poziția lui s-ar scrie peste cel nou).
+            avPlayer.pause()
+            avPlayer.replaceCurrentItem(with: nil)
+            nativeLoader = nil
+            nativeActive = true
+            diag.lastEvent = "încarc \(t.id) (nativ)"
+            Task { @MainActor in
+                let ok = await startNative(t.id, start: start, token: token)
+                if !ok && token == loadToken { fallbackToWeb(u) }
+            }
+        } else {
+            stopNative()
+            loadWeb(u)
+        }
         saveSession()
         if sponsorBlock {
             Task { @MainActor in
@@ -236,6 +288,7 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
         guard index >= 0 else { return }
         if !loaded { playIndex(index); return }
         wantPlay = true
+        if nativeActive { avPlayer.playImmediately(atRate: Float(rate)); return }
         js("window.__ppWant=true;(function(){var v=document.querySelector('video.html5-main-video')||document.querySelector('video');if(v){v.muted=false;var p=v.play();if(p&&p.catch)p.catch(function(){});}})();")
     }
 
@@ -245,6 +298,7 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
         playing = false
         lastStatTick = 0
         StatsStore.flush()
+        if nativeActive { avPlayer.pause() }
         js("window.__ppWant=false;document.querySelectorAll('video').forEach(function(v){v.pause();});")
     }
 
@@ -278,6 +332,11 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
     func seek(to s: Double) {
         let v = max(0, s)
         clock.position = v
+        if nativeActive {
+            let tol = CMTime(seconds: 0.5, preferredTimescale: 600)
+            avPlayer.seek(to: CMTime(seconds: v, preferredTimescale: 600), toleranceBefore: tol, toleranceAfter: tol)
+            return
+        }
         js("(function(){var v=document.querySelector('video.html5-main-video')||document.querySelector('video');if(v)v.currentTime=\(v);})();")
     }
 
@@ -288,8 +347,132 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
 
     func stop() {
         pause()
+        stopNative()
         web?.load(URL(string: "about:blank")!)
+        webHasContent = false
         index = -1
+    }
+
+    // MARK: - Redare nativă (AVPlayer + HLS local din fluxurile clientului iOS)
+
+    private func setupNative() {
+        avPlayer.allowsExternalPlayback = true
+        avPlayer.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.5, preferredTimescale: 600), queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.nativeTick() }
+        }
+        NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: nil, queue: .main) { [weak self] n in
+            let item = n.object as AnyObject?
+            Task { @MainActor in
+                guard let self, self.nativeActive, item === self.avPlayer.currentItem else { return }
+                self.onEnded()
+            }
+        }
+    }
+
+    /// Nivelurile YouTube („hd1080”…) ↔ înălțimea în pixeli.
+    private static let levelHeights: [(String, Int)] = [
+        ("hd2160", 2160), ("hd1440", 1440), ("hd1080", 1080), ("hd720", 720),
+        ("large", 480), ("medium", 360), ("small", 240), ("tiny", 144),
+    ]
+    private static func level(_ h: Int) -> String { levelHeights.first { h >= $0.1 }?.0 ?? "tiny" }
+    private static func maxHeight(_ q: String) -> Int { levelHeights.first { $0.0 == q }?.1 ?? 4320 }
+
+    /// true = pornit nativ (sau cererea a fost depășită de alt video); false = trebuie pagina YouTube.
+    private func startNative(_ id: String, start: Double, token: Int) async -> Bool {
+        let r = await NativeStreams.fetch(id)
+        guard token == loadToken else { return true }
+        let vids = r.videos.filter { $0.codecName == "H.264" && $0.mime == "video/mp4" && $0.indexRange != nil && $0.initRange != nil }
+        let audio = r.formats.filter { $0.isAudio && $0.codecName == "AAC" && $0.indexRange != nil && $0.initRange != nil }
+            .max { $0.bitrate < $1.bitrate }
+        let limit = Self.maxHeight(quality)
+        guard let v = vids.first(where: { $0.height <= limit }) ?? vids.last, let a = audio else {
+            diag.lastEvent = "nativ indisponibil (" + (r.error ?? "fără H.264 / AAC") + ") → pagina YouTube"
+            return false
+        }
+        do {
+            let (item, loader) = try await LocalHLS.item(video: v, audio: a, ua: NativeStreams.userAgent)
+            guard token == loadToken else { return true }
+            nativeLoader = loader
+            avPlayer.replaceCurrentItem(with: item)
+            if start > 1 {
+                // Poziția se poate seta doar după ce item-ul e gata.
+                for _ in 0..<150 where item.status == .unknown { try? await Task.sleep(nanoseconds: 100_000_000) }
+                guard token == loadToken else { return true }
+                if item.status == .readyToPlay { _ = await avPlayer.seek(to: CMTime(seconds: start, preferredTimescale: 600)) }
+            }
+            guard token == loadToken else { return true }
+            if wantPlay && !suspended { avPlayer.playImmediately(atRate: Float(rate)) }
+            qualities = Array(Set(vids.map { Self.level($0.height) })).sorted { Self.maxHeight($0) > Self.maxHeight($1) }
+            currentQuality = Self.level(v.height)
+            if let spec = r.storyboardSpec { storyboard = Storyboard(spec: spec) }
+            diag.lastEvent = "nativ: " + v.summary
+            diag.codecs = v.codecs + ", " + a.codecs
+            return true
+        } catch {
+            diag.lastEvent = "nativ: \(error.localizedDescription) → pagina YouTube"
+            return false
+        }
+    }
+
+    /// Altă calitate pe același video: reîncarcă fluxul nativ de la poziția curentă.
+    private func reloadNative() {
+        guard let t = current, loaded else { return }
+        loadToken += 1
+        let token = loadToken
+        let pos = clock.position
+        buffering = true
+        Task { @MainActor in
+            let ok = await startNative(t.id, start: pos, token: token)
+            if !ok && token == loadToken, let u = URL(string: siteMode.url(t.id, start: Int(pos))) { fallbackToWeb(u) }
+        }
+    }
+
+    private func fallbackToWeb(_ u: URL) {
+        stopNative()
+        loadWeb(u)
+    }
+
+    private func stopNative() {
+        nativeActive = false
+        avPlayer.pause()
+        avPlayer.replaceCurrentItem(with: nil)
+        nativeLoader = nil
+    }
+
+    private func loadWeb(_ u: URL) {
+        webHasContent = true
+        if ready { web?.load(u) } else { pendingURL = u }
+    }
+
+    /// Pagina YouTube nu trebuie să cânte în paralel cu player-ul nativ.
+    private func stopWebPage() {
+        pendingURL = nil
+        guard webHasContent else { return }
+        js("window.__ppWant=false;document.querySelectorAll('video').forEach(function(v){try{v.pause();}catch(e){}});")
+        if ready { web?.load(URL(string: "about:blank")!) }
+        webHasContent = false
+    }
+
+    private func nativeTick() {
+        guard nativeActive, let it = avPlayer.currentItem else { return }
+        if it.status == .failed {
+            let msg = it.error?.localizedDescription ?? "eroare"
+            diag.lastEvent = "nativ a eșuat: \(msg) → pagina YouTube"
+            if let t = current, let u = URL(string: siteMode.url(t.id, start: Int(clock.position))) { fallbackToWeb(u) }
+            return
+        }
+        guard it.status == .readyToPlay else { return }
+        let pos = avPlayer.currentTime().seconds
+        let dur = it.duration.seconds
+        let p = avPlayer.timeControlStatus == .playing
+        let buf = avPlayer.timeControlStatus == .waitingToPlayAtSpecifiedRate
+        onState(playing: p, pos: pos.isFinite ? pos : 0, dur: dur.isFinite ? dur : 0, ad: false, buf: buf, native: true)
+        let s = it.presentationSize
+        diag.videoSize = s.width > 0 ? "\(Int(s.width))×\(Int(s.height))" : "—"
+        if let e = it.accessLog()?.events.last {
+            diag.kbps = max(e.observedBitrate, 0) / 1000
+            diag.dropped = max(e.numberOfDroppedVideoFrames, 0)
+        }
     }
 
     // MARK: - Diagnostic
@@ -304,6 +487,15 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
           var mp = document.getElementById('movie_player');
           var lv = '';
           try { lv = (mp && mp.getAvailableQualityLevels) ? mp.getAvailableQualityLevels().join(', ') : ''; } catch (e) {}
+          var pr = null;
+          try { pr = (mp && mp.getPlayerResponse) ? mp.getPlayerResponse() : null; } catch (e) {}
+          if (!pr) pr = window.ytInitialPlayerResponse || null;
+          var sd = (pr && pr.streamingData) || {};
+          var af = sd.adaptiveFormats || [], pf = sd.formats || [];
+          var maxH = 0; af.concat(pf).forEach(function(f){ if (f.height > maxH) maxH = f.height; });
+          var vt = document.querySelector('video');
+          var src = vt ? (vt.currentSrc || vt.src || '') : '';
+          var srcKind = !src ? '—' : (src.indexOf('blob:') === 0 ? 'blob (MSE)' : (src.indexOf('m3u8') >= 0 || src.indexOf('manifest') >= 0 ? 'HLS' : 'fișier direct (progresiv)'));
           return JSON.stringify({
             'User agent': navigator.userAgent,
             'Pagina': location.href,
@@ -315,7 +507,13 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
             'HLS': c('application/vnd.apple.mpegurl'),
             'Player YouTube': mp ? 'da' : 'nu',
             'Calități oferite': lv || '—',
-            'Video în pagină': document.querySelectorAll('video').length + ''
+            'Video în pagină': document.querySelectorAll('video').length + '',
+            'WebAssembly': (typeof WebAssembly === 'object') ? 'da' : 'nu',
+            'Flux HLS în răspuns': sd.hlsManifestUrl ? 'da' : 'nu',
+            'Formate (adaptive / combinate)': af.length + ' / ' + pf.length + (maxH ? ' · max ' + maxH + 'p' : ''),
+            'Sursa video-ului': srcKind,
+            'Rezoluția redată': vt && vt.videoWidth ? (vt.videoWidth + '×' + vt.videoHeight) : '—',
+            'Stare redare': (pr && pr.playabilityStatus && pr.playabilityStatus.status) || '—'
           });
         })()
         """
@@ -404,6 +602,14 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
         return "Conectat: am pus \(cookies.count) cookie-uri YouTube pe Apple TV"
     }
 
+    /// Cookie-urile din WebKit (pentru feed-ul „Acasă” al contului).
+    func youTubeCookies() async -> [HTTPCookie] {
+        guard let w = web else { return [] }
+        return await withCheckedContinuation { (c: CheckedContinuation<[HTTPCookie], Never>) in
+            w.getCookies { c.resume(returning: $0) }
+        }
+    }
+
     func signOut() {
         signedIn = false
         UserDefaults.standard.set(false, forKey: "yt_signed_in")
@@ -444,7 +650,7 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
 
     nonisolated func ppWebViewDidFinish() {
         Task { @MainActor in
-            guard !self.suspended else { return }
+            guard !self.suspended, !self.nativeActive else { return }
             self.web?.evaluate(PageScripts.bridge, completion: nil)
             self.applyState()
             self.diag.lastEvent = "pagina s-a încărcat"
@@ -459,6 +665,7 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
             // În fundal tvOS oprește singur procesul paginii: NU îl repornim (ar porni video-ul
             // fără ecran și ar ține / trezi Apple TV-ul). Îl reîncărcăm doar dacă ne uităm.
             guard !self.suspended, self.loaded else { self.loaded = false; return }
+            guard !self.nativeActive else { return }
             self.diag.lastEvent = "procesul paginii a căzut — reîncarc"
             self.web?.reload()
         }
@@ -481,6 +688,8 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
         js("window.__ppWant=false;document.querySelectorAll('video').forEach(function(v){try{v.pause();v.removeAttribute('src');v.load();}catch(e){}});")
         pendingURL = nil
         if ready { web?.load(URL(string: "about:blank")!) }
+        webHasContent = false
+        stopNative()
         loaded = false
         if queue.indices.contains(index) { clock.position = WatchPositions.resumePoint(queue[index].id) ?? clock.position }
         StatsStore.flush()
@@ -520,6 +729,7 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
     private func receive(_ m: [String: Any]) {
         func d(_ k: String) -> Double { (m[k] as? NSNumber)?.doubleValue ?? 0 }
         func b(_ k: String) -> Bool { (m[k] as? NSNumber)?.boolValue ?? false }
+        if nativeActive && m["t"] as? String != "stats" { return } // pagina veche nu mai comandă
         switch m["t"] as? String {
         case "state":
             onState(playing: b("p"), pos: d("pos"), dur: d("d"), ad: b("ad"), buf: b("buf"))
@@ -529,6 +739,7 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
             qualities = (m["l"] as? [Any])?.compactMap { $0 as? String } ?? []
             currentQuality = m["c"] as? String ?? ""
         case "stats":
+            if nativeActive { return }
             diag.fps = max(0, d("fps"))
             diag.kbps = max(0, d("kbps"))
             diag.dropped = Int(d("dropped"))
@@ -543,10 +754,11 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
         }
     }
 
-    private func onState(playing p: Bool, pos: Double, dur: Double, ad: Bool, buf: Bool) {
+    private func onState(playing p: Bool, pos: Double, dur: Double, ad: Bool, buf: Bool, native: Bool = false) {
         guard let t = current else { return }
         let expected = t.expectedDuration
-        let looksAd = ad || (expected > 0 && dur > 0 && abs(dur - expected) > 5)
+        // Pe calea nativă nu există reclame: durata e a video-ului.
+        let looksAd = ad || (!native && expected > 0 && dur > 0 && abs(dur - expected) > 5)
         if looksAd && !lastAdState { diag.adsSkipped += 1 }
         lastAdState = looksAd
         if inAd != looksAd { inAd = looksAd }

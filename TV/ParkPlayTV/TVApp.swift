@@ -286,6 +286,11 @@ struct TVHomeView: View {
                                   systemImage: "play.circle.fill").lineLimit(1)
                         }
                     }
+                    if engine.signedIn {
+                        onlineShelf("De pe YouTube", "home") {
+                            await YouTubeSearch.homeFeed(cookies: await TVEngine.shared.youTubeCookies(), limit: 40)
+                        }
+                    }
                     if !hist.isEmpty { TVShelf(title: "Continuă să vizionezi", tracks: Array(hist.prefix(15))) }
                     if !model.mixes.isEmpty && favs.count + hist.count >= 3 {
                         VStack(alignment: .leading, spacing: 10) {
@@ -317,8 +322,6 @@ struct TVHomeView: View {
                     }
                     if let seed { onlineShelf("Pentru tine", "mix:" + seed.id) { await YouTubeSearch.mix(seed.id, limit: 20) } }
                     if favs.count > 2 { TVShelf(title: "Din favoritele tale", tracks: Array(favs.prefix(20))) }
-                    onlineShelf("Hituri acum", "hits") { await YouTubeSearch.search("Top hits", limit: 20) }
-                    onlineShelf("Noutăți", "new") { await YouTubeSearch.search("New hits", limit: 20) }
                     onlineShelf("Muzică românească", "ro") { await YouTubeSearch.search("muzica romaneasca hituri 2026", limit: 20) }
                     TVCategories()
                 }

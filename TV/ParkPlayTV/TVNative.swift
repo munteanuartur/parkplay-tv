@@ -10,9 +10,28 @@ import TVVLCKit
 /// Autor: arturm
 enum NativeStreams {
 
-    // Valorile clientului (de actualizat dacă YouTube îl refuză).
-    static let clientVersion = "1.65.10"
-    static let userAgent = "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"
+    /// Un client YouTube (InnerTube) prin care cerem fluxurile.
+    struct Client {
+        let name: String
+        let id: String
+        let version: String
+        let ua: String
+        let extra: [String: Any]
+    }
+
+    /// Încercați pe rând. Testat (oct. 2026): iOS 20.10.4 dă adrese directe până la 4K fără login;
+    /// iOS-ul actual din App Store nu mai dă adrese directe; ANDROID_VR cere login.
+    static let clients: [Client] = [
+        Client(name: "IOS", id: "5", version: "20.10.4",
+               ua: "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)",
+               extra: ["deviceMake": "Apple", "deviceModel": "iPhone16,2", "osName": "iPhone", "osVersion": "18.3.2.22D82"]),
+        Client(name: "ANDROID_VR", id: "28", version: "1.65.10",
+               ua: "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
+               extra: ["deviceMake": "Oculus", "deviceModel": "Quest 3", "androidSdkVersion": 32, "osName": "Android", "osVersion": "12L"]),
+    ]
+
+    /// User-Agent-ul clientului care a dat fluxurile (adresele merg doar cu el).
+    static var userAgent = clients[0].ua
 
     struct Format: Identifiable, Hashable {
         let itag: Int
@@ -24,6 +43,9 @@ enum NativeStreams {
         let fps: Int
         let bitrate: Int
         let url: URL
+        /// Unde sunt în fișier antetul (init) și indexul segmentelor (sidx) — pentru HLS-ul local.
+        var initRange: ClosedRange<Int>? = nil
+        var indexRange: ClosedRange<Int>? = nil
         var id: Int { itag }
         var isVideo: Bool { mime.hasPrefix("video/") }
         var isAudio: Bool { mime.hasPrefix("audio/") }
@@ -47,6 +69,8 @@ enum NativeStreams {
     struct Result {
         var title = ""
         var formats: [Format] = []
+        /// Miniaturile pentru bara de derulare (același format ca în pagina YouTube).
+        var storyboardSpec: String?
         var error: String?
         var videos: [Format] { formats.filter(\.isVideo).sorted { ($0.height, $0.fps, $0.bitrate) > ($1.height, $1.fps, $1.bitrate) } }
         var bestAudio: Format? {
@@ -79,39 +103,46 @@ enum NativeStreams {
         return c[13] as? String ?? ""
     }
 
-    /// Versiunile clientului VR încercate pe rând (YouTube le mai retrage).
-    static let versions = ["1.65.10", "1.62.27", "1.60.19"]
+    /// Verifică dacă YouTube chiar dă datele fluxului (primii 1024 de octeți), ca VLC să nu aștepte degeaba.
+    static func probe(_ url: URL) async -> String {
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 10
+        req.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+        req.setValue("bytes=0-1023", forHTTPHeaderField: "Range")
+        do {
+            let (d, r) = try await URLSession.shared.data(for: req)
+            let code = (r as? HTTPURLResponse)?.statusCode ?? 0
+            let ok = code == 200 || code == 206
+            return (ok ? "✓ " : "✗ ") + "HTTP \(code), \(d.count) octeți"
+        } catch {
+            return "✗ " + error.localizedDescription
+        }
+    }
 
     static func fetch(_ videoId: String) async -> Result {
         let visitor = await visitorData()
+        var errors: [String] = []
         var last = Result(error: "Fără răspuns")
-        for v in versions {
-            let r = await fetchOnce(videoId, version: v, visitor: visitor)
-            if !r.formats.isEmpty { return r }
+        for c in clients {
+            var r = await fetchOnce(videoId, client: c, visitor: visitor)
+            if !r.formats.isEmpty { userAgent = c.ua; return r }
+            if let e = r.error { errors.append("\(c.name) \(c.version): \(e)") }
+            r.error = errors.joined(separator: "\n")
             last = r
-            if let e = r.error, !e.contains("LOGIN_REQUIRED") && !e.contains("UNPLAYABLE") && !e.contains("HTTP 400") { break }
-        }
-        if let e = last.error, e.contains("LOGIN_REQUIRED") {
-            last.error = e + "\n\nYouTube cere confirmarea că nu ești robot pentru clienții neoficiali de pe adresa ta IP. " +
-                (visitor.isEmpty ? "N-am putut lua nici „visitor data”. " : "Am trimis și „visitor data”, tot nu ajunge. ") +
-                "Încearcă peste câteva ore sau cu alt video (butonul „Video-ul curent”)."
         }
         return last
     }
 
-    private static func fetchOnce(_ videoId: String, version: String, visitor: String) async -> Result {
-        let ua = "com.google.android.apps.youtube.vr.oculus/\(version) (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"
-        var client: [String: Any] = [
-                "clientName": "ANDROID_VR",
-                "clientVersion": version,
-                "deviceMake": "Oculus",
-                "deviceModel": "Quest 3",
-                "androidSdkVersion": 32,
-                "osName": "Android",
-                "osVersion": "12L",
-                "hl": "ro",
-                "gl": "RO",
-        ]
+    /// {"start":"0","end":"740"} → 0...740
+    private static func range(_ v: Any?) -> ClosedRange<Int>? {
+        guard let d = v as? [String: Any],
+              let a = Int(d["start"] as? String ?? ""), let b = Int(d["end"] as? String ?? ""), b >= a else { return nil }
+        return a...b
+    }
+
+    private static func fetchOnce(_ videoId: String, client c: Client, visitor: String) async -> Result {
+        var client: [String: Any] = ["clientName": c.name, "clientVersion": c.version, "hl": "ro", "gl": "RO"]
+        client.merge(c.extra) { a, _ in a }
         if !visitor.isEmpty { client["visitorData"] = visitor }
         let body: [String: Any] = [
             "context": ["client": client],
@@ -123,10 +154,10 @@ enum NativeStreams {
         req.httpMethod = "POST"
         req.timeoutInterval = 15
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.setValue(ua, forHTTPHeaderField: "User-Agent")
+        req.setValue(c.ua, forHTTPHeaderField: "User-Agent")
         if !visitor.isEmpty { req.setValue(visitor, forHTTPHeaderField: "X-Goog-Visitor-Id") }
-        req.setValue("28", forHTTPHeaderField: "X-YouTube-Client-Name")
-        req.setValue(version, forHTTPHeaderField: "X-YouTube-Client-Version")
+        req.setValue(c.id, forHTTPHeaderField: "X-YouTube-Client-Name")
+        req.setValue(c.version, forHTTPHeaderField: "X-YouTube-Client-Version")
         req.httpBody = try? JSONSerialization.data(withJSONObject: body)
         guard let res = try? await URLSession.shared.data(for: req) else {
             return Result(error: "Fără răspuns de la YouTube (rețea)")
@@ -139,6 +170,10 @@ enum NativeStreams {
         let play = o["playabilityStatus"] as? [String: Any]
         if let status = play?["status"] as? String, status != "OK" {
             r.error = "YouTube: \(status) — \(play?["reason"] as? String ?? "")"
+        }
+        if let sb = o["storyboards"] as? [String: Any],
+           let spec = (sb["playerStoryboardSpecRenderer"] as? [String: Any])?["spec"] as? String {
+            r.storyboardSpec = spec
         }
         let sd = o["streamingData"] as? [String: Any]
         let all = ((sd?["adaptiveFormats"] as? [[String: Any]]) ?? []) + ((sd?["formats"] as? [[String: Any]]) ?? [])
@@ -154,7 +189,8 @@ enum NativeStreams {
                 itag: f["itag"] as? Int ?? 0, mime: mime, codecs: codecs,
                 label: f["qualityLabel"] as? String ?? "",
                 width: f["width"] as? Int ?? 0, height: f["height"] as? Int ?? 0,
-                fps: f["fps"] as? Int ?? 0, bitrate: f["bitrate"] as? Int ?? 0, url: u))
+                fps: f["fps"] as? Int ?? 0, bitrate: f["bitrate"] as? Int ?? 0, url: u,
+                initRange: range(f["initRange"]), indexRange: range(f["indexRange"])))
         }
         if r.formats.isEmpty && r.error == nil { r.error = "YouTube n-a dat adrese directe (poate cere acum token)" }
         return r
@@ -169,6 +205,7 @@ struct Native4KTestView: View {
     @State private var result: NativeStreams.Result?
     @State private var loading = false
     @State private var playing: NativeStreams.Format?
+    @State private var withAudio = true
 
     private let testId = "LXb3EKWsInQ" // video natural 4K 60 fps
 
@@ -184,6 +221,7 @@ struct Native4KTestView: View {
                     Button("Video de test 4K") { load(testId) }
                     if let cur = engine.current { Button("Video-ul curent: \(cur.title.prefix(30))") { load(cur.id) } }
                 }
+                Toggle("Cu sunet (fluxul audio separat)", isOn: $withAudio)
                 if loading { ProgressView("Cer fluxurile de la YouTube…") }
                 if let r = result {
                     if !r.title.isEmpty { Text(r.title).font(.headline) }
@@ -205,7 +243,7 @@ struct Native4KTestView: View {
             .padding(60)
         }
         .fullScreenCover(item: $playing) { f in
-            VLCTestPlayerView(video: f, audio: result?.bestAudio)
+            VLCTestPlayerView(video: f, audio: withAudio ? result?.bestAudio : nil)
         }
     }
 
@@ -244,6 +282,10 @@ final class VLCTester: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     private var timer: Timer?
 
     func start(video: URL, audio: URL?, view: UIView) {
+        // Jurnalul VLC în consola Xcode (de ce rămâne „se încarcă”: 403, codec, rețea…).
+        let logger = VLCConsoleLogger()
+        logger.level = VLCLogLevel(rawValue: 2) ?? logger.level // info
+        VLCLibrary.shared().loggers = [logger]
         let media = VLCMedia(url: video)
         media.addOption(":http-user-agent=\(NativeStreams.userAgent)")
         media.addOption(":network-caching=3000")
@@ -308,6 +350,8 @@ struct VLCTestPlayerView: View {
     let video: NativeStreams.Format
     let audio: NativeStreams.Format?
     @StateObject private var t = VLCTester()
+    @State private var probeVideo = "verific…"
+    @State private var probeAudio = "verific…"
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -319,6 +363,8 @@ struct VLCTestPlayerView: View {
                 Text("Timp: \(t.time) / \(t.length)")
                 Text("Rezoluție: \(t.size)")
                 Text(String(format: "FPS afișat: %.0f · cadre pierdute: %d", t.fps, t.lost))
+                Text("Flux video: \(probeVideo)")
+                Text("Flux audio: " + (audio == nil ? "oprit" : probeAudio))
             }
             .font(.system(size: 24, design: .monospaced))
             .padding(24)
@@ -335,6 +381,10 @@ struct VLCTestPlayerView: View {
         .onPlayPauseCommand { t.player.isPlaying ? t.player.pause() : t.player.play() }
         .onExitCommand { t.stop(); dismiss() }
         .onDisappear { t.stop() }
+        .task {
+            probeVideo = await NativeStreams.probe(video.url)
+            if let a = audio { probeAudio = await NativeStreams.probe(a.url) }
+        }
     }
 }
 

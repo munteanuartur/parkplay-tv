@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import AVFoundation
 
 /// Locul paginii YouTube (WKWebView-ul) în interfață.
 struct WebHost: UIViewRepresentable {
@@ -21,6 +22,23 @@ struct WebHost: UIViewRepresentable {
             v.addSubview(wv)
         }
     }
+}
+
+/// Imaginea player-ului nativ (AVPlayer) — în locul paginii YouTube.
+struct NativeHost: UIViewRepresentable {
+    final class PlayerView: UIView {
+        override class var layerClass: AnyClass { AVPlayerLayer.self }
+        var playerLayer: AVPlayerLayer { layer as! AVPlayerLayer }
+    }
+    func makeUIView(context: Context) -> PlayerView {
+        let v = PlayerView()
+        v.backgroundColor = .black
+        v.isUserInteractionEnabled = false
+        v.playerLayer.videoGravity = .resizeAspect
+        v.playerLayer.player = TVEngine.shared.avPlayer
+        return v
+    }
+    func updateUIView(_ v: PlayerView, context: Context) {}
 }
 
 /// Player-ul pe tot ecranul, comandat cu telecomanda Siri:
@@ -52,7 +70,7 @@ struct TVPlayerView: View {
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
-            WebHost().ignoresSafeArea()
+            if engine.nativeActive { NativeHost().ignoresSafeArea() } else { WebHost().ignoresSafeArea() }
 
             if engine.wantPlay && (engine.buffering || engine.extending) && !engine.playing {
                 ProgressView().scaleEffect(1.6)

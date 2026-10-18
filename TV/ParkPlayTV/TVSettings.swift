@@ -9,6 +9,9 @@ struct TVSettingsView: View {
         NavigationStack {
             List {
                 Section("Redare") {
+                    Picker("Player", selection: $engine.playerMode) {
+                        ForEach(TVEngine.PlayerMode.allCases) { m in Text(m.title).tag(m) }
+                    }
                     Picker("Viteză", selection: $engine.rate) {
                         ForEach([0.75, 1.0, 1.25, 1.5, 2.0], id: \.self) { r in
                             Text((r == r.rounded() ? String(Int(r)) : String(r)) + "×").tag(r)
@@ -16,7 +19,7 @@ struct TVSettingsView: View {
                     }
                     Toggle("Autoplay: continuă cu video-uri asemănătoare", isOn: $engine.autoplay)
                     Toggle("SponsorBlock: sari peste intro, reclame citite", isOn: $engine.sponsorBlock)
-                    Text("Calitatea: aplicația cere cea mai bună variantă oferită de YouTube (până la 4K). Pe site-ul mobil (HLS) YouTube dă de obicei cel mult 1080p; vezi „Calități oferite” în Diagnostic.")
+                    Text("Nativ: video-ul vine direct de la YouTube și îl redă player-ul Apple, până la 1080p, fără reclame. Dacă un video nu merge așa, aplicația trece singură pe pagina YouTube (acolo calitatea poate fi mai mică). Subtitrările merg deocamdată doar pe pagina YouTube.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
 
@@ -48,6 +51,7 @@ struct TVSettingsView: View {
 
                 Section("Avansat") {
                     NavigationLink("Diagnostic (WebKit, codecuri, site)") { DiagnosticsView() }
+                    NavigationLink("Test AVPlayer — redare nativă 1080p (H.264)") { HLSTestView() }
                     NavigationLink("Test 4K — redare nativă cu VLC") { Native4KTestView() }
                 }
 
