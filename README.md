@@ -9,12 +9,23 @@
 - **Sync page** on your network (`http://<apple-tv-ip>:8080`): import / export backups, send a YouTube link to the TV, sign in to YouTube with cookies from your browser
 - Stops completely in the background, so the Apple TV can sleep
 
-> Not on the App Store: the app loads WebKit through a **private API** (tvOS has no public web view), so it is installed from Xcode with your own Apple ID. Playback uses the m.youtube page (HLS), up to **1080p**.
+> Not on the App Store: the app loads WebKit through a **private API** (tvOS has no public web view), so it is installed from Xcode with your own Apple ID. Playback goes up to **1080p** (see *How playback works*).
+
+## How playback works
+
+tvOS WebKit has no MediaSource, and YouTube no longer gives HLS to its mobile site — a plain web view only gets a single 360p file. ParkPlay TV works around it:
+
+1. **Fake MediaSource** (`TV/ParkPlayTV/TVFakeMSE.swift`): a JavaScript MediaSource / SourceBuffer is injected into the YouTube page before its own scripts. YouTube's player believes it can do adaptive streaming, picks H.264 + AAC up to 1080p and streams them itself (SABR protocol, signed in with your account, its own anti-bot checks) — the app never deals with stream URLs.
+2. **Native rendering** (`TVMSERenderer.swift`): every fMP4 chunk the player appends is sent to the app, unpacked (moov → format, moof/mdat → frames) and fed to Apple's `AVSampleBufferDisplayLayer` + `AVSampleBufferAudioRenderer` (hardware H.264 decoding). The renderer's clock is sent back to the page as `video.currentTime`, so YouTube's player buffers in step with real playback.
+3. **Keep-alive**: tvOS suspends a web page that isn't playing real media, so the page loops one second of silence.
+4. **Fallback**: if no data arrives within 15 s, the page reloads without the fake MediaSource (single 360p file).
+
+Older approaches are still in Settings → Advanced → Diagnostic → *Old tests*: the InnerTube iOS client with AVPlayer / VLC (YouTube now limits it to the first minute and blocks it per IP). `TV/tools/probe-youtube.py` shows what each YouTube client gets from your network (`--detail`, `--open`, `--deep`, `--time`).
 
 ## Requirements
 
 - A Mac with **Xcode** (latest) and your Apple ID in Xcode → Settings → Accounts (a free one works)
-- **CocoaPods** (`brew install cocoapods`) — used for the optional VLC-based 4K test
+- **CocoaPods** (`brew install cocoapods`) — required: run `pod install` in `TV/` once after cloning (VLC for the old 4K test)
 - An Apple TV (tvOS 17+) on the same network, paired with Xcode: Window → Devices and Simulators
   (on the Apple TV: Settings → Remotes and Devices → Remote App and Devices)
 

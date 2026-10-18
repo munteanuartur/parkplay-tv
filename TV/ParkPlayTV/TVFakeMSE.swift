@@ -1,6 +1,6 @@
 import Foundation
 
-/// Experiment: un MediaSource „fals” pentru pagina YouTube din WebView.
+/// Calea 1080p: un MediaSource „fals” pentru pagina YouTube din WebView.
 /// WebKit-ul de pe tvOS n-are MediaSource, iar YouTube nu mai dă HLS site-ului mobil — rămâne doar 360p.
 /// Dacă pagina crede că are MediaSource, player-ul YouTube cere formatele adaptive (până la 1080p H.264)
 /// și ne dă bucățile video prin SourceBuffer.appendBuffer. Pasul 1 (acesta) doar MĂSOARĂ ce se întâmplă:
@@ -8,15 +8,18 @@ import Foundation
 /// Rezultatul apare în Diagnostic → „MSE fals (test)”. Autor: arturm
 enum FakeMSE {
 
+    /// Calea normală pentru „Pagina YouTube” (1080p). Se poate opri doar din cod / pentru depanare.
     static var enabled: Bool {
-        get { UserDefaults.standard.bool(forKey: "fake_mse") }
-        set { UserDefaults.standard.set(newValue, forKey: "fake_mse") }
+        get { UserDefaults.standard.object(forKey: "fake_mse2") as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: "fake_mse2") }
     }
 
     /// Codul pus în pagină înaintea scripturilor YouTube.
     static let script = #"""
     (function(){
       if (window.__ppMSE) return;
+      // Rezerva aplicației: pagina reîncărcată cu ?pp_nomse=1 merge pe varianta simplă (360p).
+      if (/[?&]pp_nomse=1/.test(location.search)) return;
       var S = window.__ppMSE = {created:0, attached:0, asked:[], types:[], buffers:[], appends:0, bytes:0,
                                 net:{n:0, ok:0, bad:0, codes:{}, sabr:0, pot:0, sample:'', resp:[], ump:{}}, errors:[],
                                 dbg:{ticks: 0, sets: 0, lastSet: '', adv: 0, stuck: '', awake: false}};

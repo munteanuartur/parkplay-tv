@@ -249,6 +249,8 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
                     guard let self, !self.suspended, !self.nativeActive else { return }
                     let r = MSERenderer.shared
                     r.update()
+                    self.mseStats(r)
+                    self.checkMSEFallback(r)
                     let clock = String(format: "window.__ppClock&&window.__ppClock(%.3f,%@);", r.currentTime, r.isPlaying ? "true" : "false")
                     self.web?.evaluate(clock + "window.__ppTick&&window.__ppTick()", completion: nil)
                 }
@@ -334,6 +336,8 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
         guard let u = URL(string: siteMode.url(t.id, start: Int(start))) else { return }
         loadToken += 1
         let token = loadToken
+        mseFallback = false
+        mseStatAt = 0
         if playerMode == .native {
             stopWebPage()
             // Video-ul vechi se oprește imediat (altfel poziția lui s-ar scrie peste cel nou).
@@ -934,6 +938,42 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
         return "Conectat: am pus \(cookies.count) cookie-uri YouTube pe Apple TV"
     }
 
+    // MARK: - Calea 1080p (MediaSource fals + redare nativă): statistici și rezervă
+
+    private var mseStatAt: TimeInterval = 0
+    private var mseStatBytes = 0
+    private var mseStatFrames = 0
+    /// Video-ul curent merge pe varianta simplă (pagina fără MediaSource fals, 360p).
+    @Published private(set) var mseFallback = false
+
+    private func mseStats(_ r: MSERenderer) {
+        guard FakeMSE.enabled, !nativeActive, !mseFallback else { return }
+        let t = now()
+        let dt = t - mseStatAt
+        guard dt >= 1 else { return }
+        if mseStatAt > 0 {
+            if r.bytesIn >= mseStatBytes { diag.kbps = Double(r.bytesIn - mseStatBytes) * 8 / 1000 / dt }
+            if r.framesIn >= mseStatFrames { diag.fps = Double(r.framesIn - mseStatFrames) / dt }
+        }
+        mseStatAt = t; mseStatBytes = r.bytesIn; mseStatFrames = r.framesIn
+        diag.frames = r.framesIn
+        diag.dropped = 0
+        diag.buffer = r.ahead
+        let s = r.videoSize
+        diag.videoSize = s.width > 0 ? "\(Int(s.width))×\(Int(s.height))" : "—"
+        diag.connection = "redare nativă · " + r.info
+    }
+
+    /// Dacă MediaSource-ul fals n-a primit nimic la 15 s după încărcare, reîncărcăm pagina fără el (360p).
+    private func checkMSEFallback(_ r: MSERenderer) {
+        guard FakeMSE.enabled, !nativeActive, !mseFallback, loaded, wantPlay, webHasContent,
+              now() - loadedAt > 15, r.bytesIn == 0, !playing, let t = current else { return }
+        mseFallback = true
+        diag.lastEvent = "1080p (MediaSource) n-a primit date → varianta simplă 360p"
+        let u = siteMode.url(t.id, start: Int(clock.position))
+        if let url = URL(string: u + (u.contains("?") ? "&" : "?") + "pp_nomse=1") { loadWeb(url) }
+    }
+
     /// Cookie-urile din WebKit (pentru feed-ul „Acasă” al contului).
     func youTubeCookies() async -> [HTTPCookie] {
         guard let w = web else { return [] }
@@ -1107,6 +1147,7 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
             currentQuality = m["c"] as? String ?? ""
         case "stats":
             if nativeActive { return }
+            if FakeMSE.enabled && !mseFallback { return } // le dă redarea nativă (mseStats)
             diag.fps = max(0, d("fps"))
             diag.kbps = max(0, d("kbps"))
             diag.dropped = Int(d("dropped"))

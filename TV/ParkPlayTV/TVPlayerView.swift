@@ -97,7 +97,7 @@ struct TVPlayerView: View {
             else {
                 WebHost().ignoresSafeArea()
                 // Experimentul MediaSource fals: imaginea vine din redarea nativă, peste pagină.
-                if FakeMSE.enabled { MSEHost().ignoresSafeArea() }
+                if FakeMSE.enabled && !engine.mseFallback { MSEHost().ignoresSafeArea() }
             }
 
             if engine.wantPlay && (engine.buffering || engine.extending) && !engine.playing {
@@ -431,7 +431,6 @@ struct LiveStats: View {
 /// Ce poate WebKit-ul de pe acest Apple TV + setări de test (site, calitate, SponsorBlock, Autoplay).
 struct DiagnosticsView: View {
     @ObservedObject private var engine = TVEngine.shared
-    @AppStorage("fake_mse") private var fakeMSE = false
     @ObservedObject private var d = TVEngine.shared.diag
 
     /// Video de test 4K (natură, fără muzică).
@@ -449,7 +448,7 @@ struct DiagnosticsView: View {
                 // Experimentul MediaSource fals: sus, ca să se vadă fără derulare.
                 let mse = d.page.keys.filter { $0.hasPrefix("MSE fals") }.sorted()
                 if !mse.isEmpty {
-                    group("Experiment: MediaSource fals") {
+                    group("Redare 1080p (MediaSource fals)") {
                         ForEach(mse, id: \.self) { k in line(String(k.dropFirst("MSE fals: ".count)), d.page[k] ?? "") }
                     }
                 }
@@ -467,11 +466,17 @@ struct DiagnosticsView: View {
                     Picker("Site", selection: $engine.siteMode) {
                         ForEach(TVEngine.SiteMode.allCases) { m in Text(m.title).tag(m) }
                     }
-                    Toggle("Experiment: MediaSource fals (repornește aplicația după schimbare)", isOn: $fakeMSE)
+                    Picker("Player", selection: $engine.playerMode) {
+                        ForEach(TVEngine.PlayerMode.allCases) { m in Text(m.title).tag(m) }
+                    }
                     Toggle("SponsorBlock (sare peste intro, reclame citite)", isOn: $engine.sponsorBlock)
                     Toggle("Autoplay (continuă cu video-uri asemănătoare)", isOn: $engine.autoplay)
                 }
-                Text("ParkPlay TV · prototip · autor: arturm").font(.caption).foregroundStyle(.secondary)
+                group("Teste vechi (clientul iOS al YouTube — limitat / blocat)") {
+                    NavigationLink("Test AVPlayer — redare nativă 1080p (H.264)") { HLSTestView() }
+                    NavigationLink("Test 4K — redare nativă cu VLC") { Native4KTestView() }
+                }
+                Text("ParkPlay TV · autor: arturm").font(.caption).foregroundStyle(.secondary)
             }
             .padding(60)
         }

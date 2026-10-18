@@ -22,6 +22,10 @@ final class MSERenderer {
     /// Starea afișată în Diagnostic.
     private(set) var info = ""
     private(set) var wantPlay = false
+    /// Pentru statistici: octeți primiți, cadre video, secunde în buffer.
+    private(set) var bytesIn = 0
+    var framesIn: Int { video.frames }
+    private(set) var ahead: Double = 0
     private(set) var waiting = true
 
     private final class Track {
@@ -69,6 +73,8 @@ final class MSERenderer {
         audioRenderer.flush()
         video = Track()
         audio = Track()
+        bytesIn = 0
+        ahead = 0
         sync.setRate(0, time: .zero)
         waiting = true
         wantPlay = false
@@ -98,6 +104,7 @@ final class MSERenderer {
     /// Bucată nouă de la pagină. `kind` = "v" / "a"; `offset` = timestampOffset al SourceBuffer-ului.
     func append(kind: String, data: Data, offset: Double) {
         let tr = kind == "v" ? video : audio
+        bytesIn += data.count
         tr.pending.append(contentsOf: data)
         parse(tr, isVideo: kind == "v", offset: offset)
         pump()
@@ -110,6 +117,7 @@ final class MSERenderer {
         let active = [video, audio].filter { $0.format != nil }
         guard !active.isEmpty else { waiting = true; return }
         let ahead = (active.map { $0.lastEnd }.min() ?? 0) - t
+        self.ahead = max(ahead, 0)
         if sync.rate > 0 && ahead < 0.15 {
             sync.rate = 0
             waiting = true

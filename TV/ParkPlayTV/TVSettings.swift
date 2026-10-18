@@ -9,11 +9,8 @@ struct TVSettingsView: View {
         NavigationStack {
             List {
                 Section("Redare") {
-                    Picker("Player", selection: $engine.playerMode) {
-                        ForEach(TVEngine.PlayerMode.allCases) { m in Text(m.title).tag(m) }
-                    }
                     Picker("Calitate la pornire", selection: $engine.quality) {
-                        ForEach(TVEngine.startQualities, id: \.0) { q in Text(q.1).tag(q.0) }
+                        ForEach(TVEngine.startQualities.filter { engine.playerMode == .native || !$0.0.hasPrefix("vlc") }, id: \.0) { q in Text(q.1).tag(q.0) }
                     }
                     Picker("Viteză", selection: $engine.rate) {
                         ForEach([0.75, 1.0, 1.25, 1.5, 2.0], id: \.self) { r in
@@ -22,7 +19,7 @@ struct TVSettingsView: View {
                     }
                     Toggle("Autoplay: continuă cu video-uri asemănătoare", isOn: $engine.autoplay)
                     Toggle("SponsorBlock: sari peste intro, reclame citite", isOn: $engine.sponsorBlock)
-                    Text("Nativ: video-ul vine direct de la YouTube, fără reclame. Până la 1080p îl redă player-ul Apple (fluid, decodare hardware); peste 1080p doar VLC, care pe Apple TV ține fluid 4K la 30 fps, dar nu și la 60 fps. În player poți schimba calitatea pentru fiecare video. Dacă un video nu merge nativ, aplicația trece singură pe pagina YouTube. Subtitrările merg deocamdată doar pe pagina YouTube.")
+                    Text("Video-ul îl ia player-ul YouTube din pagină (cu contul tău), iar aplicația îl redă cu player-ul Apple: până la 1080p, decodare hardware, fără reclame. Dacă un video nu pornește așa, aplicația trece singură pe varianta simplă (360p).")
                         .font(.caption).foregroundStyle(.secondary)
                 }
 
@@ -55,8 +52,6 @@ struct TVSettingsView: View {
 
                 Section("Avansat") {
                     NavigationLink("Diagnostic (WebKit, codecuri, site)") { DiagnosticsView() }
-                    NavigationLink("Test AVPlayer — redare nativă 1080p (H.264)") { HLSTestView() }
-                    NavigationLink("Test 4K — redare nativă cu VLC") { Native4KTestView() }
                 }
 
                 Section {

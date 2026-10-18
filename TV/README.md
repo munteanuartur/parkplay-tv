@@ -9,11 +9,18 @@ Autor: arturm. Folosește aceleași scripturi (`Sources/ParkPlayVideo/Shared/Pag
 - **Ține apăsat pe orice video:** Redă acum, Redă după acesta, Adaugă la coadă, Favorite, Adaugă în playlist
 - **Sincronizare:** Setări → Sincronizare pornește o pagină web pe Apple TV (`http://IP:8080`). O deschizi pe telefon sau Mac ca să importi backup-ul ParkPlay, să descarci backup-ul de pe TV sau să trimiți un link YouTube care pornește pe televizor.
 
-Redarea folosește pagina m.youtube într-un WKWebView încărcat prin **API privat**, deci aplicația se instalează doar din Xcode, nu din App Store. Pe Apple TV, YouTube dă cel mult **1080p** pe această cale: pagina desktop, care ar da 4K, cere MediaSource, iar WebKit-ul de pe tvOS nu îl are.
+Aplicația încarcă WebKit prin **API privat**, deci se instalează doar din Xcode, nu din App Store. Redarea merge până la **1080p**:
+
+- **MediaSource fals** (`ParkPlayTV/TVFakeMSE.swift`): WebKit-ul de pe tvOS n-are MediaSource, iar YouTube nu mai dă HLS site-ului mobil (doar un fișier de 360p). Punem în pagină un MediaSource scris în JavaScript; player-ul YouTube crede că poate face streaming adaptiv, alege H.264 + AAC până la 1080p și descarcă singur datele (protocolul SABR, cu contul tău).
+- **Redare nativă** (`ParkPlayTV/TVMSERenderer.swift`): fiecare bucată fMP4 ajunge în aplicație, e despachetată și redată cu `AVSampleBufferDisplayLayer` + `AVSampleBufferAudioRenderer` (decodare hardware). Ceasul redării se trimite înapoi în pagină ca `video.currentTime`.
+- **Pagina trează**: tvOS suspendă o pagină care nu redă media reală, așa că pagina redă în buclă o secundă de liniște.
+- **Rezervă**: dacă în 15 s nu vine nimic, pagina se reîncarcă fără MediaSource fals (360p).
+
+Încercările mai vechi (clientul iOS al YouTube cu AVPlayer / VLC — YouTube îl limitează la primul minut și îl blochează pe IP) sunt în Setări → Avansat → Diagnostic → „Teste vechi”. `tools/probe-youtube.py` arată ce dă YouTube fiecărui client din rețeaua ta.
 
 ## Instalare
 
-1. Deschide `TV/ParkPlayTV.xcodeproj`. Dacă ai instalat VLC pentru testul 4K (vezi mai jos), deschide în schimb `ParkPlayTV.xcworkspace`.
+1. O singură dată: `cd TV && pod install` (CocoaPods), apoi deschide **`TV/ParkPlayTV.xcworkspace`** (nu `.xcodeproj`).
 2. Target **ParkPlayTV** → **Signing & Capabilities** → alege Team-ul.
 3. Alege Apple TV-ul ca destinație → **Run (⌘R)**.
 
