@@ -46,6 +46,8 @@ enum NativeStreams {
         /// Unde sunt în fișier antetul (init) și indexul segmentelor (sidx) — pentru HLS-ul local.
         var initRange: ClosedRange<Int>? = nil
         var indexRange: ClosedRange<Int>? = nil
+        /// Mărimea fișierului (pentru proxy-ul local al lui VLC).
+        var contentLength: Int? = nil
         var id: Int { itag }
         var isVideo: Bool { mime.hasPrefix("video/") }
         var isAudio: Bool { mime.hasPrefix("audio/") }
@@ -190,7 +192,8 @@ enum NativeStreams {
                 label: f["qualityLabel"] as? String ?? "",
                 width: f["width"] as? Int ?? 0, height: f["height"] as? Int ?? 0,
                 fps: f["fps"] as? Int ?? 0, bitrate: f["bitrate"] as? Int ?? 0, url: u,
-                initRange: range(f["initRange"]), indexRange: range(f["indexRange"])))
+                initRange: range(f["initRange"]), indexRange: range(f["indexRange"]),
+                contentLength: Int(f["contentLength"] as? String ?? "")))
         }
         if r.formats.isEmpty && r.error == nil { r.error = "YouTube n-a dat adrese directe (poate cere acum token)" }
         return r
@@ -335,12 +338,16 @@ final class VLCTester: NSObject, ObservableObject, VLCMediaPlayerDelegate {
 
 private struct VLCDrawable: UIViewRepresentable {
     let tester: VLCTester
-    let video: URL
-    let audio: URL?
+    let video: NativeStreams.Format
+    let audio: NativeStreams.Format?
     func makeUIView(context: Context) -> UIView {
         let v = UIView()
         v.backgroundColor = .black
-        DispatchQueue.main.async { tester.start(video: video, audio: audio, view: v) }
+        // VLC citește prin proxy-ul local: YouTube refuză cererile „până la final” (bytes=X-).
+        let ua = NativeStreams.userAgent
+        let vu = ChunkProxy.shared.localURL(for: video.url, ua: ua, length: video.contentLength)
+        let au = audio.map { ChunkProxy.shared.localURL(for: $0.url, ua: ua, length: $0.contentLength) }
+        DispatchQueue.main.async { tester.start(video: vu, audio: au, view: v) }
         return v
     }
     func updateUIView(_ v: UIView, context: Context) {}
@@ -356,7 +363,7 @@ struct VLCTestPlayerView: View {
 
     var body: some View {
         ZStack(alignment: .topLeading) {
-            VLCDrawable(tester: t, video: video.url, audio: audio?.url).ignoresSafeArea()
+            VLCDrawable(tester: t, video: video, audio: audio).ignoresSafeArea()
             VStack(alignment: .leading, spacing: 6) {
                 Text("VLC · " + video.summary)
                 Text("Stare: \(t.stateText)")

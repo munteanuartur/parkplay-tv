@@ -54,6 +54,17 @@ def player(name, cid, ver, ua, extra):
             c3, b3 = get(f["url"], {"User-Agent": ua, "Range": "bytes=0-65535"})
             kind = (f"{f.get('height')}p{f.get('fps','')}" if "video" in mime else f"audio {f.get('bitrate',0)//1000}k")
             print(f"{'':28}   itag {f.get('itag'):>3} {kind:12} {mime[:42]:42} -> HTTP {c3}, {len(b3)} octeți")
+    if direct and "--open" in sys.argv:
+        # Cum citește VLC: cerere fără capăt (bytes=0-) — câți octeți vin în 8 secunde?
+        import subprocess
+        for f in direct:
+            if f.get("itag") in (337, 701, 335, 299, 140):
+                out = subprocess.run(["curl", "-s", "-o", "/dev/null", "-m", "8", "-H", f"User-Agent: {ua}",
+                                      "-H", "Range: bytes=0-", "-w", "%{http_code} %{size_download} %{speed_download}", f["url"]],
+                                     capture_output=True, text=True).stdout.split()
+                if len(out) == 3:
+                    print(f"{'':28}   itag {f['itag']:>3} bytes=0- -> HTTP {out[0]}, {int(out[1])//1024} KB în 8 s, "
+                          f"{float(out[2])*8/1e6:.1f} Mbit/s")
     if sd.get("hlsManifestUrl"):
         c2, m = get(sd["hlsManifestUrl"], {"User-Agent": ua})
         res = sorted({l.split("RESOLUTION=")[1].split(",")[0] for l in m.decode(errors="ignore").splitlines() if "RESOLUTION=" in l},

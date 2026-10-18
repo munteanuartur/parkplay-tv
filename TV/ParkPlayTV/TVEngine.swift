@@ -1,6 +1,9 @@
 import SwiftUI
 import UIKit
 import AVFoundation
+#if canImport(TVVLCKit)
+import TVVLCKit
+#endif
 
 /// Poziția și durata (se schimbă des — separat, ca să nu redesenăm tot).
 @MainActor
@@ -76,6 +79,7 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
         didSet {
             UserDefaults.standard.set(quality, forKey: "quality")
             applyState()
+            if oldValue != quality { choiceOverride = nil }
             if nativeActive && oldValue != quality { reloadNative() }
         }
     }
@@ -84,6 +88,9 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
             UserDefaults.standard.set(rate, forKey: "rate")
             applyState()
             if nativeActive && avPlayer.rate > 0 { avPlayer.rate = Float(rate) }
+            #if canImport(TVVLCKit)
+            if useVLC { vlc.rate = Float(rate) }
+            #endif
         }
     }
 
@@ -105,6 +112,47 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
     @Published private(set) var nativeActive = false
     private var nativeLoader: LocalHLS?
     private var loadToken = 0
+
+    /// Calitățile de pornire (Setări → Redare).
+    static let startQualities: [(String, String)] = [
+        ("hd1080", "1080p (AVPlayer, recomandat)"),
+        ("hd720", "720p"),
+        ("large", "480p"),
+        ("vlc30", "4K / 1440p la 30 fps când există (VLC), altfel 1080p"),
+        ("vlcmax", "Maximă (VLC — la 60 fps poate sacada)"),
+    ]
+
+    /// O variantă pe care o poți alege în player pentru video-ul curent.
+    struct StreamChoice: Identifiable, Hashable {
+        let id: String
+        let label: String
+        let height: Int
+        let fps: Int
+        let vlc: Bool
+        let video: NativeStreams.Format
+    }
+    @Published private(set) var choices: [StreamChoice] = []
+    @Published private(set) var currentChoice = ""
+    /// Alegerea făcută în player pentru un video anume (are prioritate față de setare).
+    private var choiceOverride: (video: String, choice: String)?
+    /// Răspunsul YouTube pentru video-ul curent (adresele țin câteva ore) — la schimbarea calității nu-l mai cerem.
+    private var lastStreams: (id: String, result: NativeStreams.Result)?
+
+    /// Redă VLC acum (în loc de AVPlayer).
+    @Published private(set) var useVLC = false
+    #if canImport(TVVLCKit)
+    let vlc = VLCMediaPlayer()
+    /// Suprafața pe care desenează VLC (se mută în player când se deschide).
+    let vlcView: UIView = {
+        let v = UIView()
+        v.backgroundColor = .black
+        v.isUserInteractionEnabled = false
+        v.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        return v
+    }()
+    private var vlcTimer: Timer?
+    private var vlcEnded = false
+    #endif
     private var webHasContent = false
     @Published var siteMode: SiteMode {
         didSet {
@@ -153,8 +201,9 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
         let d = UserDefaults.standard
         // Fără plafon: cerem cea mai bună calitate oferită (scriptul coboară singur la ce există).
         // Vechea valoare implicită „hd1080” e trecută automat pe 4K.
-        let savedQ = d.string(forKey: "quality") ?? "hd2160"
-        quality = savedQ == "hd1080" ? "hd2160" : savedQ
+        // Calitatea la pornire (vezi `startQualities`); valorile vechi peste 1080p devin 1080p.
+        let savedQ = d.string(forKey: "quality") ?? "hd1080"
+        quality = ["hd2160", "hd1440"].contains(savedQ) ? "hd1080" : savedQ
         rate = d.object(forKey: "rate") as? Double ?? 1.0
         siteMode = SiteMode(rawValue: d.string(forKey: "site") ?? "") ?? .mobile // pe Apple TV doar mobilul merge (fără MSE)
         sponsorBlock = d.object(forKey: "sponsorblock") as? Bool ?? true
@@ -265,6 +314,9 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
             avPlayer.pause()
             avPlayer.replaceCurrentItem(with: nil)
             nativeLoader = nil
+            stopVLC()
+            choices = []
+            currentChoice = ""
             nativeActive = true
             diag.lastEvent = "încarc \(t.id) (nativ)"
             Task { @MainActor in
@@ -288,6 +340,9 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
         guard index >= 0 else { return }
         if !loaded { playIndex(index); return }
         wantPlay = true
+        #if canImport(TVVLCKit)
+        if useVLC { vlc.play(); return }
+        #endif
         if nativeActive { avPlayer.playImmediately(atRate: Float(rate)); return }
         js("window.__ppWant=true;(function(){var v=document.querySelector('video.html5-main-video')||document.querySelector('video');if(v){v.muted=false;var p=v.play();if(p&&p.catch)p.catch(function(){});}})();")
     }
@@ -299,6 +354,9 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
         lastStatTick = 0
         StatsStore.flush()
         if nativeActive { avPlayer.pause() }
+        #if canImport(TVVLCKit)
+        if useVLC { vlc.pause() }
+        #endif
         js("window.__ppWant=false;document.querySelectorAll('video').forEach(function(v){v.pause();});")
     }
 
@@ -332,6 +390,9 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
     func seek(to s: Double) {
         let v = max(0, s)
         clock.position = v
+        #if canImport(TVVLCKit)
+        if useVLC { vlc.time = VLCTime(int: Int32(min(v * 1000, Double(Int32.max)))); return }
+        #endif
         if nativeActive {
             let tol = CMTime(seconds: 0.5, preferredTimescale: 600)
             avPlayer.seek(to: CMTime(seconds: v, preferredTimescale: 600), toleranceBefore: tol, toleranceAfter: tol)
@@ -377,16 +438,88 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
     private static func level(_ h: Int) -> String { levelHeights.first { h >= $0.1 }?.0 ?? "tiny" }
     private static func maxHeight(_ q: String) -> Int { levelHeights.first { $0.0 == q }?.1 ?? 4320 }
 
+    /// Variantele unui video: H.264 până la 1080p (AVPlayer) + VP9 peste 1080p (VLC).
+    private static func buildChoices(_ r: NativeStreams.Result) -> [StreamChoice] {
+        func fpsText(_ f: Int) -> String { f > 30 ? "\(f)" : "" }
+        var out: [StreamChoice] = []
+        var seen = Set<String>()
+        for v in r.videos where v.codecName == "H.264" && v.mime == "video/mp4" && v.indexRange != nil && v.initRange != nil {
+            let key = "av\(v.height)-\(v.fps)"
+            if seen.insert(key).inserted {
+                out.append(StreamChoice(id: "av:\(v.itag)", label: "\(v.height)p\(fpsText(v.fps))", height: v.height, fps: v.fps, vlc: false, video: v))
+            }
+        }
+        #if canImport(TVVLCKit)
+        // Peste 1080p: VP9 prin VLC (decodare în software). SDR înaintea HDR (mai ușor de decodat).
+        let maxAV = out.map(\.height).max() ?? 0
+        let vp9 = r.videos.filter { $0.codecName == "VP9" && $0.height > max(maxAV, 1080) }
+            .sorted { ($0.codecs.hasPrefix("vp09.02") ? 1 : 0) < ($1.codecs.hasPrefix("vp09.02") ? 1 : 0) }
+        for v in vp9 {
+            let key = "vlc\(v.height)-\(v.fps)"
+            if seen.insert(key).inserted {
+                let hdr = v.codecs.hasPrefix("vp09.02") ? " HDR" : ""
+                let warn = v.fps > 30 ? " — poate sacada" : ""
+                out.append(StreamChoice(id: "vlc:\(v.itag)", label: "\(v.height)p\(fpsText(v.fps))\(hdr) · VLC\(warn)",
+                                        height: v.height, fps: v.fps, vlc: true, video: v))
+            }
+        }
+        #endif
+        return out.sorted { ($0.height, $0.fps) > ($1.height, $1.fps) }
+    }
+
+    /// Ce variantă pornește: alegerea din player pentru acest video, altfel setarea „Calitate la pornire”.
+    private func pickChoice(_ id: String) -> StreamChoice? {
+        if let o = choiceOverride, o.video == id, let c = choices.first(where: { $0.id == o.choice }) { return c }
+        let av = choices.filter { !$0.vlc }
+        let best1080 = av.first { $0.height <= 1080 } ?? av.last
+        switch quality {
+        case "vlcmax": return choices.first { $0.vlc } ?? best1080
+        case "vlc30": return choices.first { $0.vlc && $0.fps <= 30 } ?? best1080
+        default:
+            let limit = Self.maxHeight(quality)
+            return av.first { $0.height <= limit } ?? av.last
+        }
+    }
+
+    /// Alegerea calității din player (doar pentru video-ul curent).
+    func selectChoice(_ choiceId: String) {
+        guard let t = current, choiceId != currentChoice else { return }
+        choiceOverride = (t.id, choiceId)
+        reloadNative()
+    }
+
     /// true = pornit nativ (sau cererea a fost depășită de alt video); false = trebuie pagina YouTube.
     private func startNative(_ id: String, start: Double, token: Int) async -> Bool {
-        let r = await NativeStreams.fetch(id)
-        guard token == loadToken else { return true }
-        let vids = r.videos.filter { $0.codecName == "H.264" && $0.mime == "video/mp4" && $0.indexRange != nil && $0.initRange != nil }
-        let audio = r.formats.filter { $0.isAudio && $0.codecName == "AAC" && $0.indexRange != nil && $0.initRange != nil }
-            .max { $0.bitrate < $1.bitrate }
-        let limit = Self.maxHeight(quality)
-        guard let v = vids.first(where: { $0.height <= limit }) ?? vids.last, let a = audio else {
-            diag.lastEvent = "nativ indisponibil (" + (r.error ?? "fără H.264 / AAC") + ") → pagina YouTube"
+        let r: NativeStreams.Result
+        if let c = lastStreams, c.id == id, !c.result.formats.isEmpty {
+            r = c.result
+        } else {
+            r = await NativeStreams.fetch(id)
+            guard token == loadToken else { return true }
+            lastStreams = (id, r)
+        }
+        choices = Self.buildChoices(r)
+        guard let ch = pickChoice(id) else {
+            diag.lastEvent = "nativ indisponibil (" + (r.error ?? "fără H.264") + ") → pagina YouTube"
+            return false
+        }
+        currentChoice = ch.id
+        currentQuality = Self.level(ch.height)
+        if let spec = r.storyboardSpec { storyboard = Storyboard(spec: spec) }
+        #if canImport(TVVLCKit)
+        if ch.vlc {
+            let audio = r.bestAudio
+            startVLC(ch.video, audio: audio, start: start)
+            diag.lastEvent = "VLC: " + ch.video.summary
+            diag.codecs = ch.video.codecs + (audio.map { ", " + $0.codecs } ?? "")
+            return true
+        }
+        stopVLC()
+        #endif
+        let v = ch.video
+        guard let a = r.formats.filter({ $0.isAudio && $0.codecName == "AAC" && $0.indexRange != nil && $0.initRange != nil })
+            .max(by: { $0.bitrate < $1.bitrate }) else {
+            diag.lastEvent = "nativ: lipsește sunetul AAC → pagina YouTube"
             return false
         }
         do {
@@ -402,9 +535,6 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
             }
             guard token == loadToken else { return true }
             if wantPlay && !suspended { avPlayer.playImmediately(atRate: Float(rate)) }
-            qualities = Array(Set(vids.map { Self.level($0.height) })).sorted { Self.maxHeight($0) > Self.maxHeight($1) }
-            currentQuality = Self.level(v.height)
-            if let spec = r.storyboardSpec { storyboard = Storyboard(spec: spec) }
             diag.lastEvent = "nativ: " + v.summary
             diag.codecs = v.codecs + ", " + a.codecs
             return true
@@ -412,6 +542,67 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
             diag.lastEvent = "nativ: \(error.localizedDescription) → pagina YouTube"
             return false
         }
+    }
+
+    // MARK: - VLC (peste 1080p: VP9 decodat în software, prin proxy-ul local)
+
+    #if canImport(TVVLCKit)
+    private func startVLC(_ v: NativeStreams.Format, audio: NativeStreams.Format?, start: Double) {
+        avPlayer.pause()
+        avPlayer.replaceCurrentItem(with: nil)
+        nativeLoader = nil
+        vlc.stop()
+        let ua = NativeStreams.userAgent
+        let media = VLCMedia(url: ChunkProxy.shared.localURL(for: v.url, ua: ua, length: v.contentLength))
+        media.addOption(":network-caching=3000")
+        if start > 1 { media.addOption(":start-time=\(Int(start))") }
+        vlc.drawable = vlcView
+        vlc.media = media
+        if let a = audio {
+            vlc.addPlaybackSlave(ChunkProxy.shared.localURL(for: a.url, ua: ua, length: a.contentLength), type: .audio, enforce: true)
+        }
+        vlcEnded = false
+        useVLC = true
+        if wantPlay && !suspended {
+            vlc.play()
+            if rate != 1 { vlc.rate = Float(rate) }
+        }
+        vlcTimer?.invalidate()
+        vlcTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.vlcTick() }
+        }
+    }
+
+    private func vlcTick() {
+        guard useVLC else { return }
+        let st = vlc.state
+        if st == .error {
+            diag.lastEvent = "VLC: eroare → AVPlayer 1080p"
+            if let t = current { choiceOverride = (t.id, choices.first { !$0.vlc && $0.height <= 1080 }?.id ?? "") }
+            reloadNative()
+            return
+        }
+        if st == .ended {
+            if !vlcEnded { vlcEnded = true; onEnded() }
+            return
+        }
+        let pos = Double(vlc.time.intValue) / 1000
+        let dur = Double(vlc.media?.length.intValue ?? 0) / 1000
+        let p = vlc.isPlaying
+        onState(playing: p, pos: max(pos, 0), dur: max(dur, 0), ad: false, buf: !p && wantPlay, native: true)
+        let s = vlc.videoSize
+        diag.videoSize = s.width > 0 ? "\(Int(s.width))×\(Int(s.height))" : "—"
+        if let m = vlc.media { diag.dropped = Int(m.numberOfLostPictures) }
+    }
+    #endif
+
+    private func stopVLC() {
+        #if canImport(TVVLCKit)
+        vlcTimer?.invalidate()
+        vlcTimer = nil
+        if useVLC { vlc.stop() }
+        #endif
+        useVLC = false
     }
 
     /// Altă calitate pe același video: reîncarcă fluxul nativ de la poziția curentă.
@@ -433,6 +624,9 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
     }
 
     private func stopNative() {
+        stopVLC()
+        choices = []
+        currentChoice = ""
         nativeActive = false
         avPlayer.pause()
         avPlayer.replaceCurrentItem(with: nil)

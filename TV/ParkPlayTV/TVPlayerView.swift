@@ -41,6 +41,28 @@ struct NativeHost: UIViewRepresentable {
     func updateUIView(_ v: PlayerView, context: Context) {}
 }
 
+/// Suprafața VLC (peste 1080p) — aceeași de fiecare dată, mutată aici când se deschide player-ul.
+struct VLCHost: UIViewRepresentable {
+    func makeUIView(context: Context) -> UIView {
+        let box = UIView()
+        box.backgroundColor = .black
+        box.isUserInteractionEnabled = false
+        #if canImport(TVVLCKit)
+        let v = TVEngine.shared.vlcView
+        v.removeFromSuperview()
+        v.frame = box.bounds
+        box.addSubview(v)
+        #endif
+        return box
+    }
+    func updateUIView(_ box: UIView, context: Context) {
+        #if canImport(TVVLCKit)
+        let v = TVEngine.shared.vlcView
+        if v.superview !== box { v.removeFromSuperview(); v.frame = box.bounds; box.addSubview(v) }
+        #endif
+    }
+}
+
 /// Player-ul pe tot ecranul, comandat cu telecomanda Siri:
 ///  ⏯ = redă / pauză · stânga / dreapta (cu controalele ascunse) = ∓10 s ·
 ///  click / sus / jos = arată controalele · Menu / Înapoi = ascunde controalele, apoi închide.
@@ -70,7 +92,9 @@ struct TVPlayerView: View {
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
-            if engine.nativeActive { NativeHost().ignoresSafeArea() } else { WebHost().ignoresSafeArea() }
+            if engine.useVLC { VLCHost().ignoresSafeArea() }
+            else if engine.nativeActive { NativeHost().ignoresSafeArea() }
+            else { WebHost().ignoresSafeArea() }
 
             if engine.wantPlay && (engine.buffering || engine.extending) && !engine.playing {
                 ProgressView().scaleEffect(1.6)
@@ -227,6 +251,19 @@ struct TVPlayerView: View {
                 } label: {
                     Text("Viteză: " + (engine.rate == engine.rate.rounded() ? String(Int(engine.rate)) : String(engine.rate)) + "×")
                 }
+                // Calitatea pentru video-ul curent (H.264 cu AVPlayer; peste 1080p VP9 cu VLC).
+                Menu {
+                    if engine.choices.isEmpty {
+                        Text(engine.nativeActive ? "Se încarcă…" : "Pe pagina YouTube calitatea o alege YouTube")
+                    }
+                    ForEach(engine.choices) { c in
+                        Button { engine.selectChoice(c.id) } label: {
+                            CheckLabel(title: c.label, on: engine.currentChoice == c.id)
+                        }
+                    }
+                } label: {
+                    Text(engine.choices.first { $0.id == engine.currentChoice }.map { "\($0.height)p" + ($0.vlc ? " VLC" : "") } ?? "Calitate")
+                }
                 // Radio: după video-ul curent urmează la nesfârșit video-uri asemănătoare.
                 Button { engine.startRadio(); scheduleHide() } label: {
                     if engine.radioLoading { ProgressView() } else { Image(systemName: "dot.radiowaves.left.and.right") }
@@ -249,8 +286,9 @@ struct TVPlayerView: View {
     private var qualityText: String {
         // Rezoluția reală a video-ului (din panoul de statistici), ex. „1920×1080” → „1080p”.
         let parts = diag.videoSize.split(separator: "×")
-        if parts.count == 2, let h = Int(parts[1]), h > 0 { return "Auto · \(h)p" }
-        return "Auto"
+        let player = engine.useVLC ? "VLC" : (engine.nativeActive ? "AVPlayer" : "YouTube")
+        if parts.count == 2, let h = Int(parts[1]), h > 0 { return "\(player) · \(h)p" }
+        return player
     }
 
     private func showOSD() {
