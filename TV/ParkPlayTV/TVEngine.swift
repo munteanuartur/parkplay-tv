@@ -249,6 +249,15 @@ final class TVEngine: NSObject, ObservableObject, PPWebViewDelegate {
                     guard let self, !self.suspended, !self.nativeActive else { return }
                     let r = MSERenderer.shared
                     r.update()
+                    if r.needsReload {
+                        // Imaginea nu s-a putut reface pe loc: reîncărcăm video-ul (pagină nouă) de la aceeași secundă.
+                        r.needsReload = false
+                        if let t = self.current, let url = URL(string: self.siteMode.url(t.id, start: Int(self.clock.position))) {
+                            self.diag.lastEvent = "imagine blocată → reîncarc video-ul de la \(Int(self.clock.position)) s"
+                            r.reset()
+                            self.loadWeb(url)
+                        }
+                    }
                     self.mseStats(r)
                     self.checkMSEFallback(r)
                     let clock = String(format: "window.__ppClock&&window.__ppClock(%.3f,%@);", r.currentTime, r.isPlaying ? "true" : "false")

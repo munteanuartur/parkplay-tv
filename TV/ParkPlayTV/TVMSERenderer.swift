@@ -77,6 +77,9 @@ final class MSERenderer {
         sync.rate = 0
         displayLayer.flushAndRemoveImage()
         audioRenderer.flush()
+        noFormatFragments = 0
+        stuckSince = 0
+        needsReload = false
         if keepFormats {
             video = Self.fresh(from: video)
             audio = Self.fresh(from: audio)
@@ -175,7 +178,59 @@ final class MSERenderer {
     }
 
     /// Apelat periodic: pornește / oprește ceasul după cât e în buffer.
+    // MARK: - Autoreparare (imaginea rămasă pe loc în timp ce sunetul merge)
+
+    /// Aplicația trebuie să reîncarce video-ul curent (refacerea pe loc n-a ajutat).
+    var needsReload = false
+    private var stuckSince: Double = 0
+    private var lastFrames = 0
+    private var enqueuedVideo = 0
+    private var recoveries: [Double] = []
+    /// Fragmente video primite fără format (antetul n-a venit) — se văd în Diagnostic.
+    private(set) var noFormatFragments = 0
+
+    private func clock() -> Double { ProcessInfo.processInfo.systemUptime }
+
+    private func checkVideoHealth() {
+        guard sync.rate > 0 else { stuckSince = 0; lastFrames = enqueuedVideo; return }
+        let failed = displayLayer.status == .failed || displayLayer.requiresFlushToResumeDecoding
+        // Sunetul merge, dar la imagine nu mai ajunge nimic: coadă blocată sau cadre fără format.
+        let starving = video.format == nil && noFormatFragments > 0
+        // Coadă blocată = sunt cadre de trimis, dar renderer-ul n-a mai luat niciunul de la ultima verificare.
+        let stuck = !video.queue.isEmpty && enqueuedVideo == lastFrames
+        lastFrames = enqueuedVideo
+        if failed || starving || stuck {
+            if stuckSince == 0 { stuckSince = clock() }
+            if failed || clock() - stuckSince > 2.5 {
+                stuckSince = 0
+                recoverVideo(failed ? "decodare oprită" : (starving ? "lipsește formatul" : "coadă blocată"))
+            }
+        } else {
+            stuckSince = 0
+        }
+    }
+
+    private func recoverVideo(_ why: String) {
+        let now = clock()
+        recoveries = recoveries.filter { now - $0 < 15 } + [now]
+        if recoveries.count >= 3 || video.format == nil {
+            // Nu se repară pe loc: video-ul se reîncarcă de la aceeași secundă (pagină nouă).
+            recoveries.removeAll()
+            info = "imagine blocată (\(why)) → reîncarc video-ul"
+            needsReload = true
+            return
+        }
+        info = "imagine refăcută (\(why))"
+        displayLayer.flush()
+        let t = currentTime
+        if let vi = video.cache.lastIndex(where: { $0.key && $0.pts <= t + 0.001 }) {
+            video.queue = video.cache[vi...].map { e in e.pts < t - 0.001 ? Self.hidden(e.sb) : e.sb }
+        }
+        pump()
+    }
+
     func update() {
+        checkVideoHealth()
         let t = currentTime
         let active = [video, audio].filter { $0.format != nil }
         guard !active.isEmpty else { waiting = true; return }
@@ -199,6 +254,7 @@ final class MSERenderer {
     private func pump() {
         while displayLayer.isReadyForMoreMediaData, !video.queue.isEmpty {
             displayLayer.enqueue(video.queue.removeFirst())
+            enqueuedVideo &+= 1
         }
         while audioRenderer.isReadyForMoreMediaData, !audio.queue.isEmpty {
             audioRenderer.enqueue(audio.queue.removeFirst())
@@ -332,7 +388,10 @@ final class MSERenderer {
     }
 
     private func parseFragment(_ b: [UInt8], moofStart: Int, moofEnd: Int, _ tr: Track, isVideo: Bool, offset: Double) {
-        guard let fmt = tr.format, tr.timescale > 0 else { return }
+        guard let fmt = tr.format, tr.timescale > 0 else {
+            if isVideo { noFormatFragments += 1 }
+            return
+        }
         let ts = Int64(tr.timescale)
         let off = Int64((offset * Double(ts)).rounded())
         for (t, cs, ce, _) in Self.boxes(b, moofStart + 8, moofEnd) where t == "traf" {
@@ -391,7 +450,7 @@ final class MSERenderer {
                 }
                 tr.lastEnd = max(tr.lastEnd, Double(dts + off) / Double(ts))
                 // Limita memoriei (~400 MB video): cel mai vechi iese primul.
-                let limit = isVideo ? 400 << 20 : 40 << 20
+                let limit = isVideo ? 250 << 20 : 30 << 20
                 if tr.cacheBytes > limit {
                     var drop = 0, freed = 0
                     while drop < tr.cache.count && tr.cacheBytes - freed > limit * 3 / 4 { freed += tr.cache[drop].size; drop += 1 }
